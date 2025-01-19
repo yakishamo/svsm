@@ -3,7 +3,8 @@
 // Copyright (c) 2022-2023 SUSE LLC
 //
 // Author: Joerg Roedel <jroedel@suse.de>
-
+use core::arch::asm;
+use core::arch::x86_64::_mm_clflush;
 use crate::address::{Address, PhysAddr, VirtAddr};
 use crate::cpu::flush_tlb_global_sync;
 use crate::cpu::percpu::{this_cpu, this_cpu_shared, PERCPU_AREAS, PERCPU_VMSAS};
@@ -12,7 +13,7 @@ use crate::error::SvsmError;
 use crate::locking::RWLock;
 use crate::mm::virtualrange::{VIRT_ALIGN_2M, VIRT_ALIGN_4K};
 use crate::mm::PerCPUPageMappingGuard;
-use crate::mm::{valid_phys_address, writable_phys_addr, GuestPtr, make_page_shared};
+use crate::mm::{valid_phys_address, writable_phys_addr, GuestPtr};
 use crate::protocols::apic::{APIC_PROTOCOL, APIC_PROTOCOL_VERSION_MAX, APIC_PROTOCOL_VERSION_MIN};
 use crate::protocols::errors::SvsmReqError;
 use crate::protocols::RequestParams;
@@ -26,10 +27,6 @@ use crate::types::{PageSize, PAGE_SIZE, PAGE_SIZE_2M};
 use crate::utils::zero_mem_region;
 use cpuarch::vmsa::VMSA;
 
-use crate::platform::SVSM_PLATFORM;
-use crate::utils::MemoryRegion;
-use crate::platform::PageStateChangeOp;
-
 const SVSM_REQ_CORE_REMAP_CA: u32 = 0;
 const SVSM_REQ_CORE_PVALIDATE: u32 = 1;
 const SVSM_REQ_CORE_CREATE_VCPU: u32 = 2;
@@ -40,6 +37,9 @@ const SVSM_REQ_CORE_QUERY_PROTOCOL: u32 = 6;
 const SVSM_REQ_CORE_CONFIGURE_VTOM: u32 = 7;
 const SVSM_REQ_CORE_READ_GUESTMEM_PROTOCOL: u32 = 8;
 const SVSM_REQ_CORE_REGISTER_SHMEM : u32 = 9;
+const SVSM_REQ_CORE_CALL_TEST : u32 = 10;
+const SVSM_REQ_CORE_WRITE_SHMEM : u32 = 11;
+const SVSM_REQ_CORE_READ_SHMEM : u32 = 12;
 
 const CORE_PROTOCOL: u32 = 1;
 const CORE_PROTOCOL_VERSION_MIN: u32 = 1;
@@ -423,7 +423,7 @@ fn core_remap_ca(params: &RequestParams) -> Result<(), SvsmReqError> {
     Ok(())
 }
 
-fn read_phys(phys_addr : u64) -> Result<u64, SvsmReqError> {
+fn map_phys_decrypted(phys_addr : u64) -> Result<GuestPtr::<u64>, SvsmReqError> {
 	let phys_addr = PhysAddr::from(phys_addr & 0x0000_ffff_ffff_ffff);
 	if !(valid_phys_address(phys_addr) || phys_addr == PhysAddr(0xc0_0000_0000)) {
 		log::info!("cannot read 0x{:x}", phys_addr);
@@ -434,14 +434,41 @@ fn read_phys(phys_addr : u64) -> Result<u64, SvsmReqError> {
 	let paddr = phys_addr.page_align();
 	let guard = PerCPUPageMappingGuard::create_4k(paddr)?;
 	let start = guard.virt_addr();
+	log::info!("start : 0x{:x}", start);
+	match this_cpu()
+		.get_pgtable()
+		.set_shared_4k(start + offset) {
+			Ok(a) => Ok(a),
+			Err(e) => {
+				log::info!("set_shared_4k error");
+				Err(e)
+			}
+	}?;
+	Ok(GuestPtr::<u64>::new(start + offset))
+}
+
+
+fn read_phys(phys_addr : u64) -> Result<u64, SvsmReqError> {
+	// log::info!("read_phys called");
+	let phys_addr = PhysAddr::from(phys_addr);
+	/*
+	if !(valid_phys_address(phys_addr) || phys_addr == PhysAddr(0xc0_0000_0000)) {
+		log::info!("cannot read 0x{:x}", phys_addr);
+		return Err(SvsmReqError::invalid_parameter());
+	}
+	*/
+
+	let offset = phys_addr.page_offset();
+	let paddr = phys_addr.page_align();
+	let guard = PerCPUPageMappingGuard::create_4k(paddr)?;
+	let start = guard.virt_addr();
 	let vaddr = GuestPtr::<u64>::new(start + offset);
-	log::info!("phys_addr mapped on svsm");
-	log::info!("vaddr : 0x{:x}", start + offset);
+	// log::info!("vaddr : 0x{:x}", start + offset);
 	Ok( unsafe{ vaddr.read()? } )
 }
 
 fn read_phys_shared(phys_addr : u64) -> Result<u64, SvsmReqError> {
-	log::info!("read_phys_shared");
+	// log::info!("read_phys_shared called");
 	let phys_addr = PhysAddr::from(phys_addr & 0x0000_ffff_ffff_ffff);
 	if !(valid_phys_address(phys_addr) || phys_addr == PhysAddr(0xc0_0000_0000)) {
 		log::info!("cannot read 0x{:x}", phys_addr);
@@ -452,90 +479,197 @@ fn read_phys_shared(phys_addr : u64) -> Result<u64, SvsmReqError> {
 	let paddr = phys_addr.page_align();
 	let guard = PerCPUPageMappingGuard::create_4k(paddr)?;
 	let start = guard.virt_addr();
-	//*
-	log::info!("call make_page_shared");
-	log::info!("start : 0x{:x}", start);
-	match unsafe{ make_page_shared(start) } {
-		Ok(()) => log::info!("make_page_shared end"),
-		Err(err) => {
-			log::info!("make_page_shared error");
-			log::info!("err : {:?}", err);
-			return Err(SvsmReqError::invalid_parameter());
-		}
-	};
-//	*/
-/*
-	SVSM_PLATFORM.page_state_change(
-		MemoryRegion::new(paddr, PAGE_SIZE),
-		PageSize::Regular,
-		PageStateChangeOp::Shared,
-		)?;
 	this_cpu()
 		.get_pgtable()
-		.set_shared_4k(start)
-		.expect("Failed to remap shared page in page tables");
-	flush_tlb_global_sync();
-// */
+		.set_shared_4k(start + offset)?;
 	let vaddr = GuestPtr::<u64>::new(start + offset);
-	log::info!("phys_addr mapped on svsm");
-	log::info!("vaddr : 0x{:x}", start + offset);
+	//log::info!("vaddr : 0x{:x}", start + offset);
 	Ok( unsafe{ vaddr.read()? } )
 }
 
-fn core_read_guestmem_protocol(params: &mut RequestParams) -> Result<(), SvsmReqError> {
-	log::info!("core_my_protocol called!!!");
-	log::info!("rcx : 0x{:x}", params.rcx);
+fn read_guestmem(addr: u64) -> Result<u64, SvsmReqError> {
+	//log::info!("read_guestmem called");
 	let mut vmsa_ref = this_cpu().guest_vmsa_ref();
 	let vmsa = vmsa_ref.vmsa();
 	let cr3 = vmsa.cr3;	
 	log::info!("cr3 : 0x{:x}", cr3);
-	
-	let l4page_ent_offset = ((params.rcx >> 39) & 0b1_11111111)*8; //9bits
-	log::info!("l4page_ent_offset : 0x{:x}", l4page_ent_offset);
+	log::info!("addr : 0x{:x}", addr);
+
+	// return read_phys(addr);
+	let l4page_ent_offset = ((addr >> 39) & 0b1_11111111)*8; //9bits mask
+	log::info!("l4page_ent_offset : 0x{:x}", l4page_ent_offset/8);
 	let l4page_ent = cr3 + l4page_ent_offset;
 	log::info!("l4page_ent : 0x{:x}", l4page_ent);
 	let mut l4page_ent = read_phys(l4page_ent)?;
-	log::info!("*l4page_ent : 0x{:x}", l4page_ent);
+	log::info!("l4page_ent : 0x{:x}", l4page_ent);
 	l4page_ent &= 0x000f_ffff_ffff_f000;
+	log::info!("l4page_ent : 0x{:x}", l4page_ent);
 
-	let l3page_ent_offset = ((params.rcx >> 30) & 0b1_11111111)*8;
-	log::info!("l3page_ent_offset : 0x{:x}", l3page_ent_offset);
+	let l3page_ent_offset = ((addr >> 30) & 0b1_11111111)*8;
+	log::info!("l3page_ent_offset : 0x{:x}", l3page_ent_offset/8);
 	let l3page_ent = l4page_ent + l3page_ent_offset;
 	log::info!("l3page_ent : 0x{:x}", l3page_ent);
 	let mut l3page_ent = read_phys(l3page_ent)?;
-	log::info!("*l3page_ent : 0x{:x}", l3page_ent);
+	log::info!("l3page_ent : 0x{:x}", l3page_ent);
 	l3page_ent &= 0x000f_ffff_ffff_f000;
+	log::info!("l3page_ent : 0x{:x}", l3page_ent);
 
-	let l2page_ent_offset = ((params.rcx >> 21) & 0b1_11111111)*8;
-	log::info!("l2page_ent_offset : 0x{:x}", l2page_ent_offset);
+	let l2page_ent_offset = ((addr >> 21) & 0b1_11111111)*8;
+	log::info!("l2page_ent_offset : 0x{:x}", l2page_ent_offset/8);
 	let l2page_ent = l3page_ent + l2page_ent_offset;
 	log::info!("l2page_ent : 0x{:x}", l2page_ent);
 	let mut l2page_ent = read_phys(l2page_ent)?;
-	log::info!("*l2page_ent : 0x{:x}", l2page_ent);
+	if ((l2page_ent >> 7)&0x1) == 1 {
+		log::info!("hugepage");
+		l2page_ent &= 0x000f_ffff_ffe0_0000;
+		let phys_offset = addr & 0x1fffff;
+		let phys_addr = l2page_ent | phys_offset;
+		return match read_phys(phys_addr) {
+			Ok(num) => {
+				log::info!("num : 0x{:x}", num);
+				Ok(num)
+			},
+			Err(e) => Err(e),
+		}
+	}
+	log::info!("l2page_ent : 0x{:x}", l2page_ent);
 	l2page_ent &= 0x000f_ffff_ffff_f000;
+	log::info!("l2page_ent : 0x{:x}", l2page_ent);
 
-	let l1page_ent_offset = ((params.rcx >> 12) & 0b1_11111111)*8;
-	log::info!("l1page_ent_offset : 0x{:x}", l1page_ent_offset);
+	let l1page_ent_offset = ((addr >> 12) & 0b1_11111111)*8;
+	log::info!("l1page_ent_offset : 0x{:x}", l1page_ent_offset/8);
+	for i in 0..512 {
+		let l1page_ent = l2page_ent + i*8;
+		let l1page_ent = read_phys(l1page_ent)?;
+		log::info!("0x{:x} : 0x{:x}", i, l1page_ent);
+	}
 	let l1page_ent = l2page_ent + l1page_ent_offset;
 	log::info!("l1page_ent : 0x{:x}", l1page_ent);
 	let mut l1page_ent = read_phys(l1page_ent)?;
-	log::info!("*l1page_ent : 0x{:x}", l1page_ent);
+	/*
+	if((l1page_ent >> 32) == 0xffffffff) {
+		l1page_ent = read_guestmem(l1page_ent)?;
+	}
+	*/
+	log::info!("l1page_ent : 0x{:x}", l1page_ent);
 	l1page_ent &= 0x000f_ffff_ffff_f000;
+	log::info!("l1page_ent : 0x{:x}", l1page_ent);
 
-	let phys_offset = params.rcx & 0x0fff;
+	let phys_offset = addr & 0x0fff;
+	log::info!("phys_offset : 0x{:x}", phys_offset);
 	let phys_addr = l1page_ent + phys_offset;
 	log::info!("phys_addr : 0x{:x}", phys_addr);
-	let num = read_phys(phys_addr)?;
-	log::info!("num : {}", num);
-	params.rdx = num;
+	match read_phys(phys_addr) {
+		Ok(num) => {
+			log::info!("num : 0x{:x}", num);
+			Ok(num)
+		},
+		Err(e) => Err(e),
+	}
+}
 
+// rcx : [IN]  virtual address of guest
+// rdx : [OUT] memory contents pointed to by address
+fn core_read_guestmem_protocol(params: &mut RequestParams) -> Result<(), SvsmReqError> {
+	log::info!("rcx : 0x{:x}", params.rcx);
+	params.rdx = read_guestmem(params.rcx)?;
 	Ok(())
 }
 
-pub fn core_register_shmem(params: &mut RequestParams) -> Result<(), SvsmReqError> {
+// rcx : [IN]  shmem phys addr
+// rdx : [OUT] shmem size
+pub fn core_read_shmem(params: &mut RequestParams) -> Result<(), SvsmReqError> {
 	log::info!("core_register_shmem called");
 	let mem = read_phys_shared(params.rcx)?;
 	log::info!("shmem : {:x}", mem);
+	Ok(())
+}
+
+// dump params
+fn core_call_test(params: &mut RequestParams) -> Result<(), SvsmReqError> {
+	log::info!("call_test called");
+	log::info!("params.rcx : 0x{:x}", params.rcx);
+	log::info!("params.rdx : 0x{:x}", params.rdx);
+	log::info!("params.r8 : 0x{:x}", params.r8);
+	Ok(())
+}
+
+// no input
+fn core_write_shmem(params: &mut RequestParams) -> Result<(), SvsmReqError> {
+	// log::info!("write_shmem called");
+	unsafe {
+		if SHMEM_PHYS_ADDR == 0 {
+			log::info!("SHMEM_PHYS_ADDR not set");
+			return Err(SvsmReqError::invalid_parameter());
+		}
+	}
+	let phys_addr = unsafe { PhysAddr::from(SHMEM_PHYS_ADDR & 0x0000_ffff_ffff_ffff) };
+	if !(valid_phys_address(phys_addr) || phys_addr == PhysAddr(0xc0_0000_0000)) {
+		log::info!("cannot read 0x{:x}", phys_addr);
+		return Err(SvsmReqError::invalid_parameter());
+	}
+
+	let offset = phys_addr.page_offset();
+	let paddr = phys_addr.page_align();
+	let guard = PerCPUPageMappingGuard::create_4k(paddr)?;
+	let start = guard.virt_addr();
+	// log::info!("start : 0x{:x}", start);
+	match this_cpu()
+		.get_pgtable()
+		.set_shared_4k(start + offset) {
+			Ok(a) => Ok(a),
+			Err(e) => {
+				log::info!("set_shared_4k error");
+				Err(e)
+			}
+	}?;
+	let shmem : *mut SharedMemory = 
+		(start + offset).as_mut_ptr::<SharedMemory>() as *mut SharedMemory;
+	// log::info!("shmem.address : 0x{:x}", unsafe{(*shmem).address});
+	let mut size = unsafe{(*shmem).size};
+	if size >= 256 {
+		size = 255;
+	}
+	for i in 0..size {
+		let guest_vaddr = unsafe { (*shmem).address + i*8 };
+  	let num = match read_guestmem(guest_vaddr) {
+	  	Ok(a) => {
+	  		// log::info!("read_guestmem success");
+	  		a
+	  	},
+	  	Err(e) => {
+	  		log::info!("read_guestmem(guest_vaddr) error");
+	  		return Err(e);
+	  	}
+  	};
+		unsafe{(*shmem).value[i as usize] = num;}
+	}
+	let shmem_addr : u64 = (start + offset).into();
+	let shmem_addr : *const u8 = shmem_addr as *const u8;
+	// unsafe{asm!("clflush {}", in(reg) shmem_addr)}
+	unsafe{ _mm_clflush(shmem_addr); }
+	Ok(())
+}
+
+static mut SHMEM_PHYS_ADDR : u64 = 0;
+static mut SHMEM_SIZE : u64 = 0;
+#[repr(C)]
+struct SharedMemory {
+	address : u64,
+	size : u64,
+	value   : [u64;256]
+}
+
+// rcx : [IN] shared memory physical address
+// rdx : [IN] shared memory size
+fn core_register_shmem(params: &mut RequestParams) -> Result<(), SvsmReqError> {
+	log::info!("read_shmem called");
+	log::info!("shmem : 0x{:x}", params.rcx);
+	log::info!("shmem_size : 0x{:x}", params.rdx);
+	unsafe {
+		SHMEM_PHYS_ADDR = params.rcx;
+		SHMEM_SIZE = params.rdx;
+	}
 	Ok(())
 }
 
@@ -551,6 +685,9 @@ pub fn core_protocol_request(request: u32, params: &mut RequestParams) -> Result
         SVSM_REQ_CORE_CONFIGURE_VTOM => core_configure_vtom(params),
 				SVSM_REQ_CORE_READ_GUESTMEM_PROTOCOL => core_read_guestmem_protocol(params),
 				SVSM_REQ_CORE_REGISTER_SHMEM => core_register_shmem(params),
+				SVSM_REQ_CORE_CALL_TEST => core_call_test(params),
+				SVSM_REQ_CORE_WRITE_SHMEM => core_write_shmem(params),
+				SVSM_REQ_CORE_READ_SHMEM => core_read_shmem(params),
         _ => Err(SvsmReqError::unsupported_call()),
     }
 }

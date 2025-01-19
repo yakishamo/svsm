@@ -22,7 +22,7 @@ use crate::types::{PageSize, PAGE_SIZE};
 use crate::utils::MemoryRegion;
 
 use zerocopy::{FromBytes, FromZeros};
-
+// use crate::sev::SevSnpError;
 /// Makes a virtual page shared by revoking its validation, updating the
 /// page state, and modifying the page tables accordingly.
 ///
@@ -37,10 +37,24 @@ use zerocopy::{FromBytes, FromZeros};
 /// bit pattern.
 pub unsafe fn make_page_shared(vaddr: VirtAddr) -> Result<(), SvsmError> {
     // Revoke page validation before changing page state.
-    SVSM_PLATFORM.validate_virtual_page_range(
+		// let unchange = SvsmError::from(SevSnpError::FAIL_UNCHANGED(0x10));
+		/*
+    match SVSM_PLATFORM.validate_virtual_page_range(
         MemoryRegion::new(vaddr, PAGE_SIZE),
         PageValidateOp::Invalidate,
-    )?;
+    ) {
+			Ok(()) => {},
+			Err(e) => {
+//				if e != unchange {
+//					return Err(e);
+//				}
+			}
+		};
+		*/
+		SVSM_PLATFORM.validate_virtual_page_range(
+			MemoryRegion::new(vaddr,PAGE_SIZE),
+			PageValidateOp::Invalidate,
+			)?;
     let paddr = virt_to_phys(vaddr);
     if valid_bitmap_valid_addr(paddr) {
         valid_bitmap_clear_valid_4k(paddr);
