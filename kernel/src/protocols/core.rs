@@ -3,7 +3,7 @@
 // Copyright (c) 2022-2023 SUSE LLC
 //
 // Author: Joerg Roedel <jroedel@suse.de>
-use core::arch::asm;
+// use core::arch::asm;
 use core::arch::x86_64::_mm_clflush;
 use crate::address::{Address, PhysAddr, VirtAddr};
 use crate::cpu::flush_tlb_global_sync;
@@ -492,76 +492,45 @@ fn read_guestmem(addr: u64) -> Result<u64, SvsmReqError> {
 	let mut vmsa_ref = this_cpu().guest_vmsa_ref();
 	let vmsa = vmsa_ref.vmsa();
 	let cr3 = vmsa.cr3;	
-	log::info!("cr3 : 0x{:x}", cr3);
-	log::info!("addr : 0x{:x}", addr);
 
-	// return read_phys(addr);
 	let l4page_ent_offset = ((addr >> 39) & 0b1_11111111)*8; //9bits mask
-	log::info!("l4page_ent_offset : 0x{:x}", l4page_ent_offset/8);
 	let l4page_ent = cr3 + l4page_ent_offset;
-	log::info!("l4page_ent : 0x{:x}", l4page_ent);
 	let mut l4page_ent = read_phys(l4page_ent)?;
-	log::info!("l4page_ent : 0x{:x}", l4page_ent);
 	l4page_ent &= 0x000f_ffff_ffff_f000;
-	log::info!("l4page_ent : 0x{:x}", l4page_ent);
 
 	let l3page_ent_offset = ((addr >> 30) & 0b1_11111111)*8;
-	log::info!("l3page_ent_offset : 0x{:x}", l3page_ent_offset/8);
 	let l3page_ent = l4page_ent + l3page_ent_offset;
-	log::info!("l3page_ent : 0x{:x}", l3page_ent);
 	let mut l3page_ent = read_phys(l3page_ent)?;
-	log::info!("l3page_ent : 0x{:x}", l3page_ent);
 	l3page_ent &= 0x000f_ffff_ffff_f000;
-	log::info!("l3page_ent : 0x{:x}", l3page_ent);
 
 	let l2page_ent_offset = ((addr >> 21) & 0b1_11111111)*8;
-	log::info!("l2page_ent_offset : 0x{:x}", l2page_ent_offset/8);
 	let l2page_ent = l3page_ent + l2page_ent_offset;
-	log::info!("l2page_ent : 0x{:x}", l2page_ent);
 	let mut l2page_ent = read_phys(l2page_ent)?;
 	if ((l2page_ent >> 7)&0x1) == 1 {
-		log::info!("hugepage");
 		l2page_ent &= 0x000f_ffff_ffe0_0000;
 		let phys_offset = addr & 0x1fffff;
 		let phys_addr = l2page_ent | phys_offset;
 		return match read_phys(phys_addr) {
 			Ok(num) => {
-				log::info!("num : 0x{:x}", num);
 				Ok(num)
 			},
 			Err(e) => Err(e),
 		}
 	}
-	log::info!("l2page_ent : 0x{:x}", l2page_ent);
 	l2page_ent &= 0x000f_ffff_ffff_f000;
-	log::info!("l2page_ent : 0x{:x}", l2page_ent);
 
 	let l1page_ent_offset = ((addr >> 12) & 0b1_11111111)*8;
-	log::info!("l1page_ent_offset : 0x{:x}", l1page_ent_offset/8);
 	for i in 0..512 {
 		let l1page_ent = l2page_ent + i*8;
-		let l1page_ent = read_phys(l1page_ent)?;
-		log::info!("0x{:x} : 0x{:x}", i, l1page_ent);
 	}
 	let l1page_ent = l2page_ent + l1page_ent_offset;
-	log::info!("l1page_ent : 0x{:x}", l1page_ent);
 	let mut l1page_ent = read_phys(l1page_ent)?;
-	/*
-	if((l1page_ent >> 32) == 0xffffffff) {
-		l1page_ent = read_guestmem(l1page_ent)?;
-	}
-	*/
-	log::info!("l1page_ent : 0x{:x}", l1page_ent);
 	l1page_ent &= 0x000f_ffff_ffff_f000;
-	log::info!("l1page_ent : 0x{:x}", l1page_ent);
 
 	let phys_offset = addr & 0x0fff;
-	log::info!("phys_offset : 0x{:x}", phys_offset);
 	let phys_addr = l1page_ent + phys_offset;
-	log::info!("phys_addr : 0x{:x}", phys_addr);
 	match read_phys(phys_addr) {
 		Ok(num) => {
-			log::info!("num : 0x{:x}", num);
 			Ok(num)
 		},
 		Err(e) => Err(e),
@@ -626,24 +595,63 @@ fn core_write_shmem(params: &mut RequestParams) -> Result<(), SvsmReqError> {
 	let shmem : *mut SharedMemory = 
 		(start + offset).as_mut_ptr::<SharedMemory>() as *mut SharedMemory;
 	// log::info!("shmem.address : 0x{:x}", unsafe{(*shmem).address});
+	/*
 	let mut size = unsafe{(*shmem).size};
 	if size >= 256 {
 		size = 255;
 	}
-	for i in 0..size {
+	if size == 0 {
+		'loop1: for i in 0..256 {
+			let guest_vaddr = unsafe { (*shmem).address + i*8 };
+			let num = match read_guestmem(guest_vaddr) {
+				Ok(a) => {
+					a
+				},
+				Err(e) => {
+					log::info!("read_guestmem(guest_vaddr) error");
+					return Err(e);
+				}
+			};
+			unsafe{ (*shmem).value[i as usize] = num; }
+			for j in 0..8 {
+				if ((num >> j) & 0xff) == 0 {
+					break 'loop1;
+				}
+			}
+		}
+	} else {
+		for i in 0..size {
+			let guest_vaddr = unsafe { (*shmem).address + i*8 };
+			let num = match read_guestmem(guest_vaddr) {
+				Ok(a) => {
+					// log::info!("read_guestmem success");
+					a
+				},
+				Err(e) => {
+					log::info!("read_guestmem(guest_vaddr) error");
+					return Err(e);
+				}
+			};
+			unsafe{(*shmem).value[i as usize] = num;}
+		}
+	}
+	*/
+	for i in 0..512 {
 		let guest_vaddr = unsafe { (*shmem).address + i*8 };
-  	let num = match read_guestmem(guest_vaddr) {
-	  	Ok(a) => {
-	  		// log::info!("read_guestmem success");
-	  		a
-	  	},
-	  	Err(e) => {
-	  		log::info!("read_guestmem(guest_vaddr) error");
-	  		return Err(e);
-	  	}
-  	};
+		log::info!("{} : 0x{:x} ",i ,guest_vaddr);
+		let num = match read_guestmem(guest_vaddr) {
+			Ok(a) => {
+				// log::info!("read_guestmem success");
+				a
+			},
+			Err(e) => {
+				log::info!("read_guestmem(guest_vaddr) error");
+				return Err(e);
+			}
+		};
 		unsafe{(*shmem).value[i as usize] = num;}
 	}
+
 	let shmem_addr : u64 = (start + offset).into();
 	let shmem_addr : *const u8 = shmem_addr as *const u8;
 	// unsafe{asm!("clflush {}", in(reg) shmem_addr)}
@@ -657,7 +665,7 @@ static mut SHMEM_SIZE : u64 = 0;
 struct SharedMemory {
 	address : u64,
 	size : u64,
-	value   : [u64;256]
+	value   : [u64;512]
 }
 
 // rcx : [IN] shared memory physical address
