@@ -488,7 +488,7 @@ fn read_phys_shared(phys_addr : u64) -> Result<u64, SvsmReqError> {
 }
 
 fn read_guestmem(addr: u64) -> Result<u64, SvsmReqError> {
-	//log::info!("read_guestmem called");
+	// log::info!("read_guestmem called");
 	let mut vmsa_ref = this_cpu().guest_vmsa_ref();
 	let vmsa = vmsa_ref.vmsa();
 	let cr3 = vmsa.cr3;	
@@ -496,20 +496,24 @@ fn read_guestmem(addr: u64) -> Result<u64, SvsmReqError> {
 	let l4page_ent_offset = ((addr >> 39) & 0b1_11111111)*8; //9bits mask
 	let l4page_ent = cr3 + l4page_ent_offset;
 	let mut l4page_ent = read_phys(l4page_ent)?;
+	// log::info!("  l4: 0x{:x}", l4page_ent);
 	l4page_ent &= 0x000f_ffff_ffff_f000;
 
 	let l3page_ent_offset = ((addr >> 30) & 0b1_11111111)*8;
 	let l3page_ent = l4page_ent + l3page_ent_offset;
 	let mut l3page_ent = read_phys(l3page_ent)?;
+	// log::info!("  l3: 0x{:x}", l3page_ent);
 	l3page_ent &= 0x000f_ffff_ffff_f000;
 
 	let l2page_ent_offset = ((addr >> 21) & 0b1_11111111)*8;
 	let l2page_ent = l3page_ent + l2page_ent_offset;
 	let mut l2page_ent = read_phys(l2page_ent)?;
+	// log::info!("  l2: 0x{:x}", l2page_ent);
 	if ((l2page_ent >> 7)&0x1) == 1 {
 		l2page_ent &= 0x000f_ffff_ffe0_0000;
 		let phys_offset = addr & 0x1fffff;
 		let phys_addr = l2page_ent | phys_offset;
+		// log::info!("phys_addr : 0x{:x}", phys_addr);
 		return match read_phys(phys_addr) {
 			Ok(num) => {
 				Ok(num)
@@ -525,6 +529,7 @@ fn read_guestmem(addr: u64) -> Result<u64, SvsmReqError> {
 	}
 	let l1page_ent = l2page_ent + l1page_ent_offset;
 	let mut l1page_ent = read_phys(l1page_ent)?;
+	// log::info!("  l1: 0x{:x}", l1page_ent);
 	l1page_ent &= 0x000f_ffff_ffff_f000;
 
 	let phys_offset = addr & 0x0fff;
@@ -566,6 +571,8 @@ fn core_call_test(params: &mut RequestParams) -> Result<(), SvsmReqError> {
 // no input
 fn core_write_shmem(params: &mut RequestParams) -> Result<(), SvsmReqError> {
 	// log::info!("write_shmem called");
+
+	// mapping shared memory
 	unsafe {
 		if SHMEM_PHYS_ADDR == 0 {
 			log::info!("SHMEM_PHYS_ADDR not set");
@@ -580,18 +587,27 @@ fn core_write_shmem(params: &mut RequestParams) -> Result<(), SvsmReqError> {
 
 	let offset = phys_addr.page_offset();
 	let paddr = phys_addr.page_align();
-	let guard = PerCPUPageMappingGuard::create_4k(paddr)?;
+	let guard = PerCPUPageMappingGuard::create(paddr, paddr + PAGE_SIZE*2, 0)?;
 	let start = guard.virt_addr();
 	// log::info!("start : 0x{:x}", start);
-	match this_cpu()
+	this_cpu()
 		.get_pgtable()
-		.set_shared_4k(start + offset) {
-			Ok(a) => Ok(a),
-			Err(e) => {
-				log::info!("set_shared_4k error");
-				Err(e)
-			}
-	}?;
+		.set_shared_4k(start + offset)?;
+	this_cpu()
+		.get_pgtable()
+		.set_shared_4k(start + offset + PAGE_SIZE)?;
+	
+	
+	/*
+	let paddr = phys_addr.page_align() + PAGE_SIZE;
+	let shmem_value_guard = PerCPUPageMappingGuard::create_4k(paddr)?;
+	let shmem_value_start = guard.virt_addr();
+	log::info!("shmem_value_start : 0x{:x}(0x{:x})", shmem_value_start, paddr);
+	this_cpu()
+		.get_pgtable()
+		.set_shared_4k(shmem_value_start + offset)?;
+		*/
+
 	let shmem : *mut SharedMemory = 
 		(start + offset).as_mut_ptr::<SharedMemory>() as *mut SharedMemory;
 	// log::info!("shmem.address : 0x{:x}", unsafe{(*shmem).address});
@@ -636,12 +652,14 @@ fn core_write_shmem(params: &mut RequestParams) -> Result<(), SvsmReqError> {
 		}
 	}
 	*/
+	// log::info!("addr : 0x{:x}", unsafe{ (*shmem).address });
+	let target_guest_addr = unsafe{(*shmem).address};
 	for i in 0..512 {
-		let guest_vaddr = unsafe { (*shmem).address + i*8 };
-		log::info!("{} : 0x{:x} ",i ,guest_vaddr);
+		let guest_vaddr = target_guest_addr + i*8;
+		// log::info!("{} : 0x{:x} ",i ,guest_vaddr);
 		let num = match read_guestmem(guest_vaddr) {
 			Ok(a) => {
-				// log::info!("read_guestmem success");
+				// log::info!("read_guestmem success : 0x{:x}", a);
 				a
 			},
 			Err(e) => {
@@ -651,6 +669,7 @@ fn core_write_shmem(params: &mut RequestParams) -> Result<(), SvsmReqError> {
 		};
 		unsafe{(*shmem).value[i as usize] = num;}
 	}
+	unsafe{(*shmem).size = 4096;}
 
 	let shmem_addr : u64 = (start + offset).into();
 	let shmem_addr : *const u8 = shmem_addr as *const u8;
@@ -665,7 +684,8 @@ static mut SHMEM_SIZE : u64 = 0;
 struct SharedMemory {
 	address : u64,
 	size : u64,
-	value   : [u64;512]
+	buf : [u64;510],
+	value : [u64;512]
 }
 
 // rcx : [IN] shared memory physical address
