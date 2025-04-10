@@ -21,6 +21,7 @@ pub mod vm;
 pub use address_space::*;
 pub use guestmem::{copy_from_user, copy_to_user, GuestPtr};
 pub use memory::{valid_phys_address, writable_phys_addr};
+pub use page_visibility::make_page_shared;
 pub use pagebox::*;
 pub use ptguards::*;
 

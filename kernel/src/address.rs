@@ -192,7 +192,7 @@ pub trait Address:
 #[verus_verify]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(transparent)]
-pub struct PhysAddr(InnerAddr);
+pub struct PhysAddr(pub InnerAddr);
 
 #[verus_verify]
 impl PhysAddr {

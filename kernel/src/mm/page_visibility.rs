@@ -22,7 +22,7 @@ use crate::types::{PageSize, PAGE_SIZE};
 use crate::utils::MemoryRegion;
 
 use zerocopy::{FromBytes, FromZeros};
-
+// use crate::sev::SevSnpError;
 /// Makes a virtual page shared by revoking its validation, updating the
 /// page state, and modifying the page tables accordingly.
 ///
@@ -35,16 +35,32 @@ use zerocopy::{FromBytes, FromZeros};
 /// Converting the memory at `vaddr` must be safe within Rust's memory model.
 /// Notably any objects at `vaddr` must tolerate unsynchronized writes of any
 /// bit pattern.
-unsafe fn make_page_shared(vaddr: VirtAddr) -> Result<(), SvsmError> {
+pub unsafe fn make_page_shared(vaddr: VirtAddr) -> Result<(), SvsmError> {
     // Revoke page validation before changing page state.
-    SVSM_PLATFORM.validate_virtual_page_range(
+		// let unchange = SvsmError::from(SevSnpError::FAIL_UNCHANGED(0x10));
+		/*
+    match SVSM_PLATFORM.validate_virtual_page_range(
         MemoryRegion::new(vaddr, PAGE_SIZE),
         PageValidateOp::Invalidate,
-    )?;
+    ) {
+			Ok(()) => {},
+			Err(e) => {
+//				if e != unchange {
+//					return Err(e);
+//				}
+			}
+		};
+		*/
+		SVSM_PLATFORM.validate_virtual_page_range(
+			MemoryRegion::new(vaddr,PAGE_SIZE),
+			PageValidateOp::Invalidate,
+			)?;
     let paddr = virt_to_phys(vaddr);
     if valid_bitmap_valid_addr(paddr) {
         valid_bitmap_clear_valid_4k(paddr);
     }
+
+		log::info!("validate_virtual_page_range");
 
     // Ask the hypervisor to make the page shared.
     SVSM_PLATFORM.page_state_change(
