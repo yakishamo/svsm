@@ -7,6 +7,7 @@
 extern crate alloc;
 
 use alloc::collections::btree_map::BTreeMap;
+use alloc::string::String;
 use alloc::sync::Arc;
 use core::fmt;
 use core::mem::size_of;
@@ -15,28 +16,67 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::address::{Address, VirtAddr};
 use crate::cpu::idt::svsm::return_new_task;
-use crate::cpu::percpu::PerCpu;
+use crate::cpu::irq_state::EFLAGS_IF;
+use crate::cpu::percpu::{current_task, PerCpu};
+use crate::cpu::shadow_stack::is_cet_ss_supported;
 use crate::cpu::sse::{get_xsave_area_size, sse_restore_context};
-use crate::cpu::X86ExceptionContext;
-use crate::cpu::{irqs_enable, X86GeneralRegs};
+use crate::cpu::{irqs_enable, X86ExceptionContext, X86GeneralRegs};
 use crate::error::SvsmError;
-use crate::fs::FileHandle;
+use crate::fs::{opendir, stdout_open, Directory, FileHandle};
 use crate::locking::{RWLock, SpinLock};
 use crate::mm::pagetable::{PTEntryFlags, PageTable};
-use crate::mm::vm::{Mapping, VMFileMappingFlags, VMKernelStack, VMR};
-use crate::mm::PageBox;
-use crate::mm::{
-    mappings::create_anon_mapping, mappings::create_file_mapping, VMMappingGuard,
-    SVSM_PERTASK_BASE, SVSM_PERTASK_END, SVSM_PERTASK_STACK_BASE, USER_MEM_END, USER_MEM_START,
+use crate::mm::vm::{
+    Mapping, ShadowStackInit, VMFileMappingFlags, VMKernelShadowStack, VMKernelStack, VMR,
 };
+use crate::mm::{
+    alloc::AllocError, mappings::create_anon_mapping, mappings::create_file_mapping, PageBox,
+    VMMappingGuard, SIZE_LEVEL3, SVSM_PERTASK_BASE, SVSM_PERTASK_END,
+    SVSM_PERTASK_EXCEPTION_SHADOW_STACK_BASE_OFFSET, SVSM_PERTASK_SHADOW_STACK_BASE_OFFSET,
+    SVSM_PERTASK_STACK_BASE_OFFSET, USER_MEM_END, USER_MEM_START,
+};
+use crate::platform::SVSM_PLATFORM;
 use crate::syscall::{Obj, ObjError, ObjHandle};
 use crate::types::{SVSM_USER_CS, SVSM_USER_DS};
-use crate::utils::MemoryRegion;
+use crate::utils::bitmap_allocator::{BitmapAllocator, BitmapAllocator1024};
+use crate::utils::{is_aligned, MemoryRegion};
 use intrusive_collections::{intrusive_adapter, LinkedListAtomicLink};
 
 use super::schedule::{current_task_terminated, schedule};
 
+pub static KTASK_VADDR_BITMAP: SpinLock<BitmapAllocator1024> =
+    SpinLock::new(BitmapAllocator1024::new_empty());
+
 pub const INITIAL_TASK_ID: u32 = 1;
+
+// The task virtual range guard manages the allocation of a task virtual
+// address range within the task address space.  The address range is reserved
+// as long as the guard continues to exist.
+#[derive(Debug)]
+struct TaskVirtualRegionGuard {
+    index: usize,
+}
+
+impl TaskVirtualRegionGuard {
+    fn alloc() -> Result<Self, SvsmError> {
+        let index = KTASK_VADDR_BITMAP
+            .lock()
+            .alloc(1, 0)
+            .ok_or(SvsmError::Alloc(AllocError::OutOfMemory))?;
+        Ok(Self { index })
+    }
+
+    fn vaddr_region(&self) -> MemoryRegion<VirtAddr> {
+        const SPAN: usize = SIZE_LEVEL3 / BitmapAllocator1024::CAPACITY;
+        let base = SVSM_PERTASK_BASE + (self.index * SPAN);
+        MemoryRegion::<VirtAddr>::new(base, SPAN)
+    }
+}
+
+impl Drop for TaskVirtualRegionGuard {
+    fn drop(&mut self) {
+        KTASK_VADDR_BITMAP.lock().free(self.index, 1);
+    }
+}
 
 #[derive(PartialEq, Debug, Copy, Clone, Default)]
 pub enum TaskState {
@@ -86,7 +126,7 @@ impl TaskIDAllocator {
 
 static TASK_ID_ALLOCATOR: TaskIDAllocator = TaskIDAllocator::new();
 
-#[repr(C)]
+#[repr(C, packed)]
 #[derive(Default, Debug, Clone, Copy)]
 pub struct TaskContext {
     pub rsp: u64,
@@ -119,13 +159,22 @@ impl TaskSchedState {
 pub struct Task {
     pub rsp: u64,
 
+    pub ssp: VirtAddr,
+
     /// XSave area
     pub xsa: PageBox<[u8]>,
 
     pub stack_bounds: MemoryRegion<VirtAddr>,
 
+    pub exception_shadow_stack: VirtAddr,
+
     /// Page table that is loaded when the task is scheduled
     pub page_table: SpinLock<PageBox<PageTable>>,
+
+    /// Virtual address region that has been allocated for this task.
+    /// This is not referenced but must be stored so that it is dropped when
+    /// the Task is dropped.
+    _ktask_region: TaskVirtualRegionGuard,
 
     /// Task virtual memory range for use at CPL 0
     vm_kernel_range: VMR,
@@ -136,8 +185,14 @@ pub struct Task {
     /// State relevant for scheduler
     sched_state: RWLock<TaskSchedState>,
 
+    /// User-visible name of task
+    name: String,
+
     /// ID of the task
     id: u32,
+
+    /// Root directory for this task
+    rootdir: Arc<dyn Directory>,
 
     /// Link to global task list
     list_link: LinkedListAtomicLink,
@@ -152,7 +207,10 @@ pub struct Task {
 // SAFETY: Send + Sync is required for Arc<Task> to implement Send. All members
 // of  `Task` are Send + Sync except for the intrusive_collection links, which
 // are only Send. The only access to these is via the intrusive_adapter!
-// generated code which does not use them concurrently across threads.
+// generated code which does not use them concurrently across threads.  The
+// kernal address cell is also not Sync, but this is only populated during
+// task creation, and can safely be accessed by multiple threads once it has
+// been populated.
 unsafe impl Sync for Task {}
 
 pub type TaskPointer = Arc<Task>;
@@ -176,105 +234,173 @@ impl fmt::Debug for Task {
     }
 }
 
+struct CreateTaskArguments {
+    // The entry point of the task.  For user tasks, this is a user-mode
+    // address, and for kernel tasks, it is a kernel address,
+    entry: usize,
+
+    // The name of the task.
+    name: String,
+
+    // For a user task, supplies the `VMR` that will represent the user-mode
+    // address space.
+    vm_user_range: Option<VMR>,
+
+    // The root directory that will be associated with this task.
+    rootdir: Arc<dyn Directory>,
+}
+
 impl Task {
-    pub fn create(cpu: &PerCpu, entry: extern "C" fn()) -> Result<TaskPointer, SvsmError> {
+    fn create_common(cpu: &PerCpu, args: CreateTaskArguments) -> Result<TaskPointer, SvsmError> {
         let mut pgtable = cpu.get_pgtable().clone_shared()?;
 
         cpu.populate_page_table(&mut pgtable);
 
-        let vm_kernel_range = VMR::new(SVSM_PERTASK_BASE, SVSM_PERTASK_END, PTEntryFlags::empty());
-        vm_kernel_range.initialize()?;
+        let ktask_region = TaskVirtualRegionGuard::alloc()?;
+        let vaddr_region = ktask_region.vaddr_region();
+        let vm_kernel_range = VMR::new(
+            vaddr_region.start(),
+            vaddr_region.end(),
+            PTEntryFlags::empty(),
+        );
+        // SAFETY: The selected kernel mode task address range is the only
+        // range that will live within the top-level entry associated with the
+        // task address space.
+        unsafe {
+            vm_kernel_range.initialize()?;
+        }
 
         let xsa = Self::allocate_xsave_area();
         let xsa_addr = u64::from(xsa.vaddr()) as usize;
-        let (stack, raw_bounds, rsp_offset) = Self::allocate_ktask_stack(cpu, entry, xsa_addr)?;
-        vm_kernel_range.insert_at(SVSM_PERTASK_STACK_BASE, stack)?;
+
+        // Determine which kernel-mode entry/exit routines will be used for
+        // this task.
+        let (entry_return, exit_return) = if args.vm_user_range.is_some() {
+            (return_new_task as usize, None)
+        } else {
+            (run_kernel_task as usize, Some(task_exit as usize))
+        };
+
+        let mut shadow_stack_offset = VirtAddr::null();
+        let mut exception_shadow_stack = VirtAddr::null();
+        if is_cet_ss_supported() {
+            let shadow_stack;
+            (shadow_stack, shadow_stack_offset) = VMKernelShadowStack::new(
+                vaddr_region.start() + SVSM_PERTASK_SHADOW_STACK_BASE_OFFSET,
+                ShadowStackInit::Normal {
+                    entry_return,
+                    exit_return,
+                },
+            )?;
+            vm_kernel_range.insert_at(
+                vaddr_region.start() + SVSM_PERTASK_SHADOW_STACK_BASE_OFFSET,
+                Arc::new(Mapping::new(shadow_stack)),
+            )?;
+
+            let shadow_stack;
+            (shadow_stack, exception_shadow_stack) = VMKernelShadowStack::new(
+                vaddr_region.start() + SVSM_PERTASK_EXCEPTION_SHADOW_STACK_BASE_OFFSET,
+                ShadowStackInit::Exception,
+            )?;
+            vm_kernel_range.insert_at(
+                vaddr_region.start() + SVSM_PERTASK_EXCEPTION_SHADOW_STACK_BASE_OFFSET,
+                Arc::new(Mapping::new(shadow_stack)),
+            )?;
+        }
+
+        // Call the correct stack creation routine for this task.
+        let (stack, raw_bounds, rsp_offset) = if args.vm_user_range.is_some() {
+            Self::allocate_utask_stack(cpu, args.entry, xsa_addr)?
+        } else {
+            Self::allocate_ktask_stack(cpu, args.entry, xsa_addr)?
+        };
+        let stack_start = vaddr_region.start() + SVSM_PERTASK_STACK_BASE_OFFSET;
+        vm_kernel_range.insert_at(stack_start, stack)?;
 
         vm_kernel_range.populate(&mut pgtable);
 
         // Remap at the per-task offset
-        let bounds = MemoryRegion::new(
-            SVSM_PERTASK_STACK_BASE + raw_bounds.start().into(),
-            raw_bounds.len(),
-        );
+        let bounds = MemoryRegion::new(stack_start + raw_bounds.start().into(), raw_bounds.len());
+        // Stack frames should be 16b-aligned
+        debug_assert!(bounds.end().is_aligned(16));
 
         Ok(Arc::new(Task {
             rsp: bounds
                 .end()
                 .checked_sub(rsp_offset)
-                .expect("Invalid stack offset from task::allocate_ktask_stack()")
+                .expect("Invalid stack offset from task stack allocator")
                 .bits() as u64,
+            ssp: shadow_stack_offset,
             xsa,
             stack_bounds: bounds,
+            exception_shadow_stack,
             page_table: SpinLock::new(pgtable),
+            _ktask_region: ktask_region,
             vm_kernel_range,
-            vm_user_range: None,
+            vm_user_range: args.vm_user_range,
             sched_state: RWLock::new(TaskSchedState {
                 idle_task: false,
                 state: TaskState::RUNNING,
                 cpu: cpu.get_apic_id(),
             }),
+            name: args.name,
             id: TASK_ID_ALLOCATOR.next_id(),
+            rootdir: args.rootdir,
             list_link: LinkedListAtomicLink::default(),
             runlist_link: LinkedListAtomicLink::default(),
             objs: Arc::new(RWLock::new(BTreeMap::new())),
         }))
     }
 
-    pub fn create_user(cpu: &PerCpu, user_entry: usize) -> Result<TaskPointer, SvsmError> {
-        let mut pgtable = cpu.get_pgtable().clone_shared()?;
+    pub fn create(
+        cpu: &PerCpu,
+        entry: extern "C" fn(),
+        name: String,
+    ) -> Result<TaskPointer, SvsmError> {
+        let create_args = CreateTaskArguments {
+            entry: entry as usize,
+            name,
+            vm_user_range: None,
+            rootdir: opendir("/")?,
+        };
+        Self::create_common(cpu, create_args)
+    }
 
-        cpu.populate_page_table(&mut pgtable);
-
-        let vm_kernel_range = VMR::new(SVSM_PERTASK_BASE, SVSM_PERTASK_END, PTEntryFlags::empty());
-        vm_kernel_range.initialize()?;
-
-        let xsa = Self::allocate_xsave_area();
-        let xsa_addr = u64::from(xsa.vaddr()) as usize;
-        let (stack, raw_bounds, stack_offset) =
-            Self::allocate_utask_stack(cpu, user_entry, xsa_addr)?;
-        vm_kernel_range.insert_at(SVSM_PERTASK_STACK_BASE, stack)?;
-
-        vm_kernel_range.populate(&mut pgtable);
-
+    pub fn create_user(
+        cpu: &PerCpu,
+        user_entry: usize,
+        root: Arc<dyn Directory>,
+        name: String,
+    ) -> Result<TaskPointer, SvsmError> {
         let vm_user_range = VMR::new(USER_MEM_START, USER_MEM_END, PTEntryFlags::USER);
-        vm_user_range.initialize_lazy()?;
-
-        // Remap at the per-task offset
-        let bounds = MemoryRegion::new(
-            SVSM_PERTASK_STACK_BASE + raw_bounds.start().into(),
-            raw_bounds.len(),
-        );
-
-        Ok(Arc::new(Task {
-            rsp: bounds
-                .end()
-                .checked_sub(stack_offset)
-                .expect("Invalid stack offset from task::allocate_utask_stack()")
-                .bits() as u64,
-            xsa,
-            stack_bounds: bounds,
-            page_table: SpinLock::new(pgtable),
-            vm_kernel_range,
+        // SAFETY: the user address range is fully aligned to top-level paging
+        // boundaries.
+        unsafe {
+            vm_user_range.initialize_lazy()?;
+        }
+        let create_args = CreateTaskArguments {
+            entry: user_entry,
+            name,
             vm_user_range: Some(vm_user_range),
-            sched_state: RWLock::new(TaskSchedState {
-                idle_task: false,
-                state: TaskState::RUNNING,
-                cpu: cpu.get_apic_id(),
-            }),
-            id: TASK_ID_ALLOCATOR.next_id(),
-            list_link: LinkedListAtomicLink::default(),
-            runlist_link: LinkedListAtomicLink::default(),
-            objs: Arc::new(RWLock::new(BTreeMap::new())),
-        }))
+            rootdir: root,
+        };
+        Self::create_common(cpu, create_args)
     }
 
     pub fn stack_bounds(&self) -> MemoryRegion<VirtAddr> {
         self.stack_bounds
     }
 
+    pub fn get_task_name(&self) -> &String {
+        &self.name
+    }
+
     pub fn get_task_id(&self) -> u32 {
         self.id
+    }
+
+    pub fn rootdir(&self) -> Arc<dyn Directory> {
+        self.rootdir.clone()
     }
 
     pub fn set_task_running(&self) {
@@ -345,7 +471,7 @@ impl Task {
 
     fn allocate_ktask_stack(
         cpu: &PerCpu,
-        entry: extern "C" fn(),
+        entry: usize,
         xsa_addr: usize,
     ) -> Result<(Arc<Mapping>, MemoryRegion<VirtAddr>, usize), SvsmError> {
         let (mapping, bounds) = Task::allocate_stack_common()?;
@@ -354,29 +480,41 @@ impl Task {
 
         // We need to setup a context on the stack that matches the stack layout
         // defined in switch_context below.
-        let stack_ptr = (percpu_mapping.virt_addr() + bounds.end().bits()).as_mut_ptr::<u64>();
+        let stack_tos = percpu_mapping.virt_addr() + bounds.end().bits();
+        // Make space for the task termination handler
+        let stack_offset = size_of::<u64>();
+        let stack_ptr = stack_tos
+            .checked_sub(stack_offset)
+            .unwrap()
+            .as_mut_ptr::<u8>();
+        // To ensure stack frames are 16b-aligned, ret_addr must be 16b-aligned
+        // so that (%rsp + 8) is 16b-aligned after the ret instruction in
+        // switch_context
+        debug_assert!(VirtAddr::from(stack_ptr)
+            .checked_sub(8)
+            .unwrap()
+            .is_aligned(16));
 
         // 'Push' the task frame onto the stack
         unsafe {
-            let tc_offset: isize = ((size_of::<TaskContext>() / size_of::<u64>()) + 1)
-                .try_into()
-                .unwrap();
-            let task_context = stack_ptr.offset(-tc_offset).cast::<TaskContext>();
+            let task_context = stack_ptr
+                .sub(size_of::<TaskContext>())
+                .cast::<TaskContext>();
             // The processor flags must always be in a default state, unrelated
             // to the flags of the caller.  In particular, interrupts must be
             // disabled because the task switch code expects to execute a new
             // task with interrupts disabled.
             (*task_context).flags = 2;
             // ret_addr
-            (*task_context).regs.rdi = entry as *const () as usize;
+            (*task_context).regs.rdi = entry;
             // xsave area addr
             (*task_context).regs.rsi = xsa_addr;
             (*task_context).ret_addr = run_kernel_task as *const () as u64;
             // Task termination handler for when entry point returns
-            stack_ptr.offset(-1).write(task_exit as *const () as u64);
+            stack_ptr.cast::<u64>().write(task_exit as *const () as u64);
         }
 
-        Ok((mapping, bounds, size_of::<TaskContext>() + size_of::<u64>()))
+        Ok((mapping, bounds, stack_offset + size_of::<TaskContext>()))
     }
 
     fn allocate_utask_stack(
@@ -385,14 +523,32 @@ impl Task {
         xsa_addr: usize,
     ) -> Result<(Arc<Mapping>, MemoryRegion<VirtAddr>, usize), SvsmError> {
         let (mapping, bounds) = Task::allocate_stack_common()?;
+        // Do not run user-mode with IRQs enabled on platforms which are not
+        // ready for it.
+        let iret_rflags: usize = if SVSM_PLATFORM.use_interrupts() {
+            2 | EFLAGS_IF
+        } else {
+            2
+        };
 
         let percpu_mapping = cpu.new_mapping(mapping.clone())?;
 
         // We need to setup a context on the stack that matches the stack layout
         // defined in switch_context below.
-        let stack_ptr = (percpu_mapping.virt_addr() + bounds.end().bits()).as_mut_ptr::<u8>();
-
-        let mut stack_offset = size_of::<X86ExceptionContext>();
+        let stack_tos = percpu_mapping.virt_addr() + bounds.end().bits();
+        // Make space for the IRET frame
+        let stack_offset = size_of::<X86ExceptionContext>();
+        let stack_ptr = stack_tos
+            .checked_sub(stack_offset)
+            .unwrap()
+            .as_mut_ptr::<u8>();
+        // To ensure stack frames are 16b-aligned, ret_addr must be 16b-aligned
+        // so that (%rsp + 8) is 16b-aligned after the ret instruction in
+        // switch_context
+        debug_assert!(VirtAddr::from(stack_ptr)
+            .checked_sub(8)
+            .unwrap()
+            .is_aligned(16));
 
         // 'Push' the task frame onto the stack
         unsafe {
@@ -401,15 +557,14 @@ impl Task {
             let mut iret_frame = X86ExceptionContext::default();
             iret_frame.frame.rip = user_entry;
             iret_frame.frame.cs = (SVSM_USER_CS | 3).into();
-            iret_frame.frame.flags = 0x202;
+            iret_frame.frame.flags = iret_rflags;
             iret_frame.frame.rsp = (USER_MEM_END - 8).into();
             iret_frame.frame.ss = (SVSM_USER_DS | 3).into();
+            debug_assert!(is_aligned(iret_frame.frame.rsp + 8, 16));
 
             // Copy IRET frame to stack
-            let stack_iret_frame = stack_ptr.sub(stack_offset).cast::<X86ExceptionContext>();
+            let stack_iret_frame = stack_ptr.cast::<X86ExceptionContext>();
             *stack_iret_frame = iret_frame;
-
-            stack_offset += size_of::<TaskContext>();
 
             let mut task_context = TaskContext {
                 ret_addr: VirtAddr::from(return_new_task as *const ())
@@ -421,11 +576,13 @@ impl Task {
 
             // xsave area addr
             task_context.regs.rdi = xsa_addr;
-            let stack_task_context = stack_ptr.sub(stack_offset).cast::<TaskContext>();
+            let stack_task_context = stack_ptr
+                .sub(size_of::<TaskContext>())
+                .cast::<TaskContext>();
             *stack_task_context = task_context;
         }
 
-        Ok((mapping, bounds, stack_offset))
+        Ok((mapping, bounds, stack_offset + size_of::<TaskContext>()))
     }
 
     fn allocate_xsave_area() -> PageBox<[u8]> {
@@ -548,6 +705,34 @@ impl Task {
         Ok(id)
     }
 
+    /// Adds an object to the current task and maps it to a given object-id.
+    ///
+    /// # Arguments
+    ///
+    /// * `obj` - The object to be added.
+    /// * `handle` - Object handle to reference the object.
+    ///
+    /// # Returns
+    ///
+    /// * `Result<ObjHandle, SvsmError>` - Returns the object handle for the object
+    ///   to be added if successful, or an `SvsmError` on failure.
+    ///
+    /// # Errors
+    ///
+    /// This function will return an error if allocating the object handle
+    /// fails or the object id is already in use.
+    pub fn add_obj_at(&self, obj: Arc<dyn Obj>, handle: ObjHandle) -> Result<ObjHandle, SvsmError> {
+        let mut objs = self.objs.lock_write();
+
+        if objs.get(&handle).is_some() {
+            return Err(SvsmError::from(ObjError::Busy));
+        }
+
+        objs.insert(handle, obj);
+
+        Ok(handle)
+    }
+
     /// Removes an object from the current task.
     ///
     /// # Arguments
@@ -599,11 +784,31 @@ pub fn is_task_fault(vaddr: VirtAddr) -> bool {
         || (vaddr >= SVSM_PERTASK_BASE && vaddr < SVSM_PERTASK_END)
 }
 
+fn task_attach_console() {
+    let file_handle = stdout_open();
+    let obj_handle = ObjHandle::new(0);
+    current_task()
+        .add_obj_at(file_handle, obj_handle)
+        .expect("Failed to attach console");
+}
+
 /// Runs the first time a new task is scheduled, in the context of the new
 /// task. Any first-time initialization and setup work for a new task that
 /// needs to happen in its context must be done here.
+/// # Safety
+/// The caller is required to verify the correctness of the save area address.
 #[no_mangle]
-fn setup_new_task(xsa_addr: u64) {
+unsafe fn setup_user_task(xsa_addr: u64) {
+    // SAFETY: caller needs to make sure xsa_addr is valid and points to a
+    // memory region of sufficient size.
+    unsafe {
+        // Needs to be the first function called here.
+        setup_new_task_common(xsa_addr);
+    }
+    task_attach_console();
+}
+
+unsafe fn setup_new_task_common(xsa_addr: u64) {
     // Re-enable IRQs here, as they are still disabled from the
     // schedule()/sched_init() functions. After the context switch the IrqGuard
     // from the previous task is not dropped, which causes IRQs to stay
@@ -612,16 +817,21 @@ fn setup_new_task(xsa_addr: u64) {
     // subsequent task switches will go through schedule() and there the guard
     // is dropped, re-enabling IRQs.
 
-    // SAFETY: Safe because this matches the IrqGuard drop in
-    // schedule()/schedule_init(). See description above.
+    irqs_enable();
+
+    // SAFETY: The caller takes responsibility for the correctness of the save
+    // area address.
     unsafe {
-        irqs_enable();
         sse_restore_context(xsa_addr);
     }
 }
 
 extern "C" fn run_kernel_task(entry: extern "C" fn(), xsa_addr: u64) {
-    setup_new_task(xsa_addr);
+    // SAFETY: the save area address is provided by the context switch assembly
+    // code.
+    unsafe {
+        setup_new_task_common(xsa_addr);
+    }
     entry();
 }
 
@@ -632,9 +842,11 @@ extern "C" fn task_exit() {
     schedule();
 }
 
-#[cfg(test)]
+#[cfg(all(test, test_in_svsm))]
 mod tests {
-    use crate::task::create_kernel_task;
+    extern crate alloc;
+    use crate::task::start_kernel_task;
+    use alloc::string::String;
     use core::arch::asm;
     use core::arch::global_asm;
 
@@ -725,7 +937,8 @@ mod tests {
     #[test]
     #[cfg_attr(not(test_in_svsm), ignore = "Can only be run inside guest")]
     fn test_fpu_context_switch() {
-        create_kernel_task(task1).expect("Failed to launch request processing task");
+        start_kernel_task(task1, String::from("task1"))
+            .expect("Failed to launch request processing task");
     }
 
     extern "C" fn task1() {
@@ -734,7 +947,8 @@ mod tests {
             asm!("call test_fpu", options(att_syntax));
         }
 
-        create_kernel_task(task2).expect("Failed to launch request processing task");
+        start_kernel_task(task2, String::from("task2"))
+            .expect("Failed to launch request processing task");
 
         unsafe {
             asm!("call check_fpu", out("rax") ret, options(att_syntax));

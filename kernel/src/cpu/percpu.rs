@@ -6,32 +6,58 @@
 
 extern crate alloc;
 
-use super::gdt_mut;
+use super::cpuset::AtomicCpuSet;
+use super::gdt::GDT;
+use super::ipi::{
+    handle_ipi_interrupt, send_ipi, IpiBoard, IpiHelperMut, IpiHelperShared, IpiMessage,
+    IpiMessageMut, IpiTarget,
+};
+use super::isst::Isst;
+use super::msr::write_msr;
+use super::shadow_stack::{is_cet_ss_supported, ISST_ADDR};
 use super::tss::{X86Tss, IST_DF};
-use crate::address::{Address, PhysAddr, VirtAddr};
+use crate::address::{Address, PhysAddr, VirtAddr, VirtPhysPair};
+use crate::cpu::control_regs::{read_cr0, read_cr4};
+use crate::cpu::efer::read_efer;
 use crate::cpu::idt::common::INT_INJ_VECTOR;
 use crate::cpu::tss::TSS_LIMIT;
 use crate::cpu::vmsa::{init_guest_vmsa, init_svsm_vmsa};
+use crate::cpu::vmsa::{svsm_code_segment, svsm_data_segment, svsm_gdt_segment, svsm_idt_segment};
 use crate::cpu::{IrqState, LocalApic};
 use crate::error::{ApicError, SvsmError};
+use crate::hyperv;
+use crate::hyperv::HypercallPagesGuard;
 use crate::locking::{LockGuard, RWLock, RWLockIrqSafe, SpinLock};
+use crate::mm::alloc::allocate_pages;
 use crate::mm::pagetable::{PTEntryFlags, PageTable};
 use crate::mm::virtualrange::VirtualRange;
-use crate::mm::vm::{Mapping, VMKernelStack, VMPhysMem, VMRMapping, VMReserved, VMR};
-use crate::mm::{
-    virt_to_phys, PageBox, SVSM_PERCPU_BASE, SVSM_PERCPU_CAA_BASE, SVSM_PERCPU_END,
-    SVSM_PERCPU_TEMP_BASE_2M, SVSM_PERCPU_TEMP_BASE_4K, SVSM_PERCPU_TEMP_END_2M,
-    SVSM_PERCPU_TEMP_END_4K, SVSM_PERCPU_VMSA_BASE, SVSM_STACKS_INIT_TASK, SVSM_STACK_IST_DF_BASE,
+use crate::mm::vm::{
+    Mapping, ShadowStackInit, VMKernelShadowStack, VMKernelStack, VMPhysMem, VMRMapping,
+    VMReserved, VMR,
 };
-use crate::platform::{SvsmPlatform, SVSM_PLATFORM};
+use crate::mm::{
+    virt_to_phys, PageBox, SVSM_CONTEXT_SWITCH_SHADOW_STACK, SVSM_CONTEXT_SWITCH_STACK,
+    SVSM_PERCPU_BASE, SVSM_PERCPU_CAA_BASE, SVSM_PERCPU_END, SVSM_PERCPU_TEMP_BASE_2M,
+    SVSM_PERCPU_TEMP_BASE_4K, SVSM_PERCPU_TEMP_END_2M, SVSM_PERCPU_TEMP_END_4K,
+    SVSM_PERCPU_VMSA_BASE, SVSM_SHADOW_STACKS_INIT_TASK, SVSM_SHADOW_STACK_ISST_DF_BASE,
+    SVSM_STACK_IST_DF_BASE,
+};
+use crate::platform::{halt, SvsmPlatform, SVSM_PLATFORM};
+use crate::requests::{request_loop_main, request_processing_main};
 use crate::sev::ghcb::{GhcbPage, GHCB};
 use crate::sev::hv_doorbell::{allocate_hv_doorbell_page, HVDoorbell};
 use crate::sev::msr_protocol::{hypervisor_ghcb_features, GHCBHvFeatures};
 use crate::sev::utils::RMPFlags;
 use crate::sev::vmsa::{VMSAControl, VmsaPage};
-use crate::task::{schedule, schedule_task, RunQueue, Task, TaskPointer, WaitQueue};
-use crate::types::{PAGE_SHIFT, PAGE_SHIFT_2M, PAGE_SIZE, PAGE_SIZE_2M, SVSM_TR_FLAGS, SVSM_TSS};
+use crate::task::{
+    schedule, schedule_task, start_kernel_task, RunQueue, Task, TaskPointer, WaitQueue,
+};
+use crate::types::{
+    PAGE_SHIFT, PAGE_SHIFT_2M, PAGE_SIZE, PAGE_SIZE_2M, SVSM_TR_ATTRIBUTES, SVSM_TSS,
+};
 use crate::utils::MemoryRegion;
+use alloc::format;
+use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cell::{Cell, OnceCell, Ref, RefCell, RefMut, UnsafeCell};
@@ -39,7 +65,7 @@ use core::mem::size_of;
 use core::ptr;
 use core::slice::Iter;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use cpuarch::vmsa::{VMSASegment, VMSA};
+use cpuarch::vmsa::VMSA;
 
 #[derive(Copy, Clone, Debug)]
 pub struct PerCpuInfo {
@@ -82,9 +108,16 @@ impl PerCpuAreas {
         }
     }
 
+    fn next_cpu_index(&self) -> usize {
+        let ptr = unsafe { self.areas.get().as_ref().unwrap() };
+        ptr.len()
+    }
+
     unsafe fn push(&self, info: PerCpuInfo) {
-        let ptr = self.areas.get().as_mut().unwrap();
+        let ptr = unsafe { self.areas.get().as_mut().unwrap() };
         ptr.push(info);
+        let cpu_shared = ptr[info.as_cpu_ref().cpu_index];
+        assert_eq!(cpu_shared.apic_id, info.cpu_shared.apic_id);
     }
 
     pub fn iter(&self) -> Iter<'_, PerCpuInfo> {
@@ -93,7 +126,7 @@ impl PerCpuAreas {
     }
 
     // Fails if no such area exists or its address is NULL
-    pub fn get(&self, apic_id: u32) -> Option<&'static PerCpuShared> {
+    pub fn get_by_apic_id(&self, apic_id: u32) -> Option<&'static PerCpuShared> {
         // For this to not produce UB the only invariant we must
         // uphold is that there are no mutations or mutable aliases
         // going on when casting via as_ref(). This only happens via
@@ -103,17 +136,25 @@ impl PerCpuAreas {
             .find(|info| info.apic_id == apic_id)
             .map(|info| info.cpu_shared)
     }
+
+    /// Callers are expected to specify a valid CPU index.
+    pub fn get_by_cpu_index(&self, index: usize) -> &'static PerCpuShared {
+        let ptr = unsafe { self.areas.get().as_ref().unwrap() };
+        ptr[index].cpu_shared
+    }
 }
 
 #[derive(Debug)]
 struct IstStacks {
     double_fault_stack: Cell<Option<VirtAddr>>,
+    double_fault_shadow_stack: Cell<Option<VirtAddr>>,
 }
 
 impl IstStacks {
     const fn new() -> Self {
         IstStacks {
             double_fault_stack: Cell::new(None),
+            double_fault_shadow_stack: Cell::new(None),
         }
     }
 }
@@ -186,27 +227,42 @@ impl GuestVmsaRef {
 #[derive(Debug)]
 pub struct PerCpuShared {
     apic_id: u32,
+    cpu_index: usize,
     guest_vmsa: SpinLock<GuestVmsaRef>,
     online: AtomicBool,
     ipi_irr: [AtomicU32; 8],
     ipi_pending: AtomicBool,
     nmi_pending: AtomicBool,
+
+    // A set of CPUs that have requested IPI handling by this CPU.
+    ipi_requests: AtomicCpuSet,
+
+    // A bulletin board holding the state of an IPI message to send to other
+    // CPUs.
+    ipi_board: IpiBoard,
 }
 
 impl PerCpuShared {
-    fn new(apic_id: u32) -> Self {
+    fn new(apic_id: u32, cpu_index: usize) -> Self {
         PerCpuShared {
             apic_id,
+            cpu_index,
             guest_vmsa: SpinLock::new(GuestVmsaRef::new()),
             online: AtomicBool::new(false),
             ipi_irr: core::array::from_fn(|_| AtomicU32::new(0)),
             ipi_pending: AtomicBool::new(false),
             nmi_pending: AtomicBool::new(false),
+            ipi_requests: Default::default(),
+            ipi_board: IpiBoard::default(),
         }
     }
 
     pub const fn apic_id(&self) -> u32 {
         self.apic_id
+    }
+
+    pub const fn cpu_index(&self) -> usize {
+        self.cpu_index
     }
 
     pub fn update_guest_vmsa_caa(&self, vmsa: PhysAddr, caa: PhysAddr) {
@@ -269,6 +325,18 @@ impl PerCpuShared {
     pub fn nmi_pending(&self) -> bool {
         self.nmi_pending.swap(false, Ordering::Relaxed)
     }
+
+    pub fn ipi_from(&self, cpu_index: usize) {
+        self.ipi_requests.add(cpu_index, Ordering::Release);
+    }
+
+    /// # Safety
+    /// The IPI board is not `Sync`, so the caller is responsible for ensuring
+    /// that a reference to the IPI board is only obtained when it is safe to
+    /// do so.
+    pub unsafe fn ipi_board(&self) -> &IpiBoard {
+        &self.ipi_board
+    }
 }
 
 const _: () = assert!(size_of::<PerCpu>() <= PAGE_SIZE);
@@ -284,11 +352,16 @@ pub struct PerCpu {
     /// Per-CPU storage that might be accessed from other CPUs.
     shared: PerCpuShared,
 
+    /// Reference to the `PerCpuShared` that is valid in the global, shared
+    /// address space.
+    shared_global: OnceCell<&'static PerCpuShared>,
+
     /// PerCpu IRQ state tracking
     irq_state: IrqState,
 
     pgtbl: RefCell<Option<&'static mut PageTable>>,
-    tss: Cell<X86Tss>,
+    tss: X86Tss,
+    isst: Cell<Isst>,
     svsm_vmsa: OnceCell<VmsaPage>,
     reset_ip: Cell<u64>,
     /// PerCpu Virtual Memory Range
@@ -307,10 +380,14 @@ pub struct PerCpu {
     /// GHCB page for this CPU.
     ghcb: OnceCell<GhcbPage>,
 
+    /// Hypercall input/output pages for this CPU if running under Hyper-V.
+    hypercall_pages: RefCell<Option<(VirtPhysPair, VirtPhysPair)>>,
+
     /// `#HV` doorbell page for this CPU.
     hv_doorbell: Cell<Option<&'static HVDoorbell>>,
 
-    init_stack: Cell<Option<VirtAddr>>,
+    init_shadow_stack: Cell<Option<VirtAddr>>,
+    context_switch_stack: Cell<Option<VirtAddr>>,
     ist: IstStacks,
 
     /// Stack boundaries of the currently running task.
@@ -319,11 +396,12 @@ pub struct PerCpu {
 
 impl PerCpu {
     /// Creates a new default [`PerCpu`] struct.
-    fn new(apic_id: u32) -> Self {
+    fn new(apic_id: u32, cpu_index: usize) -> Self {
         Self {
             pgtbl: RefCell::new(None),
             irq_state: IrqState::new(),
-            tss: Cell::new(X86Tss::new()),
+            tss: X86Tss::new(),
+            isst: Cell::new(Isst::default()),
             svsm_vmsa: OnceCell::new(),
             reset_ip: Cell::new(0xffff_fff0),
             vm_range: {
@@ -338,10 +416,13 @@ impl PerCpu {
             request_waitqueue: RefCell::new(WaitQueue::new()),
             apic: RefCell::new(None),
 
-            shared: PerCpuShared::new(apic_id),
+            shared: PerCpuShared::new(apic_id, cpu_index),
+            shared_global: OnceCell::new(),
             ghcb: OnceCell::new(),
+            hypercall_pages: RefCell::new(None),
             hv_doorbell: Cell::new(None),
-            init_stack: Cell::new(None),
+            init_shadow_stack: Cell::new(None),
+            context_switch_stack: Cell::new(None),
             ist: IstStacks::new(),
             current_stack: Cell::new(MemoryRegion::new(VirtAddr::null(), 0)),
         }
@@ -350,8 +431,12 @@ impl PerCpu {
     /// Creates a new default [`PerCpu`] struct, allocates it via the page
     /// allocator and adds it to the global per-cpu area list.
     pub fn alloc(apic_id: u32) -> Result<&'static Self, SvsmError> {
-        let page = PageBox::try_new(Self::new(apic_id))?;
+        // APIC IDs are expected to be unique.
+        assert!(PERCPU_AREAS.get_by_apic_id(apic_id).is_none());
+        let cpu_index = PERCPU_AREAS.next_cpu_index();
+        let page = PageBox::try_new(Self::new(apic_id, cpu_index))?;
         let percpu = PageBox::leak(page);
+        percpu.set_shared_global();
         unsafe { PERCPU_AREAS.push(PerCpuInfo::new(apic_id, &percpu.shared)) };
         Ok(percpu)
     }
@@ -360,28 +445,57 @@ impl PerCpu {
         &self.shared
     }
 
+    fn set_shared_global(&'static self) {
+        self.shared_global
+            .set(&self.shared)
+            .expect("shared global set more than once");
+    }
+
+    pub fn shared_global(&self) -> &'static PerCpuShared {
+        self.shared_global.get().unwrap()
+    }
+
     /// Disables IRQs on the current CPU. Keeps track of the nesting level and
     /// the original IRQ state.
-    ///
-    /// # Safety
     ///
     /// Caller needs to make sure to match every `disable()` call with an
     /// `enable()` call.
     #[inline(always)]
-    pub unsafe fn irqs_disable(&self) {
+    pub fn irqs_disable(&self) {
         self.irq_state.disable();
     }
 
     /// Reduces IRQ-disable nesting level on the current CPU and restores the
     /// original IRQ state when the level reaches 0.
     ///
-    /// # Safety
-    ///
     /// Caller needs to make sure to match every `disable()` call with an
     /// `enable()` call.
     #[inline(always)]
-    pub unsafe fn irqs_enable(&self) {
+    pub fn irqs_enable(&self) {
         self.irq_state.enable();
+    }
+
+    /// Increments IRQ-disable nesting level on the current CPU without
+    /// disabling interrupts.  This is used by exception and interrupt dispatch
+    /// routines that have already disabled interrupts.
+    ///
+    /// Caller needs to make sure to match every `push_nesting()` call with a
+    /// `pop_nesting()` call.
+    #[inline(always)]
+    pub fn irqs_push_nesting(&self, was_enabled: bool) {
+        self.irq_state.push_nesting(was_enabled);
+    }
+
+    /// Reduces IRQ-disable nesting level on the current CPU without restoring
+    /// the original IRQ state original IRQ state.  This is used by exception
+    /// and interrupt dispatch routines that will restore interrupt state
+    /// naturally.
+    ///
+    /// Caller needs to make sure to match every `disable()` call with a
+    /// `pop_state()` call.
+    #[inline(always)]
+    pub fn irqs_pop_nesting(&self) {
+        let _ = self.irq_state.pop_nesting();
     }
 
     /// Get IRQ-disable nesting count on the current CPU
@@ -389,8 +503,69 @@ impl PerCpu {
     /// # Returns
     ///
     /// Current nesting depth of irq_disable() calls.
-    pub fn irq_nesting_count(&self) -> isize {
+    pub fn irq_nesting_count(&self) -> i32 {
         self.irq_state.count()
+    }
+
+    /// Raises TPR on the current CPU.  Keeps track of the nesting level.
+    ///
+    /// The caller must ensure that every `raise_tpr()` call is followed by a
+    /// matching call to `lower_tpr()`.
+    #[inline(always)]
+    pub fn raise_tpr(&self, tpr_value: usize) {
+        self.irq_state.raise_tpr(tpr_value);
+    }
+
+    /// Lowers TPR from the current level to the new level required by the
+    /// current nesting state.
+    ///
+    /// The caller must ensure that a `lower_tpr()` call balances a preceding
+    /// `raise_tpr()` call to the indicated level.
+    ///
+    /// * `tpr_value` - The TPR from which the caller would like to lower.
+    ///   Must be less than or equal to the current TPR.
+    #[inline(always)]
+    pub fn lower_tpr(&self, tpr_value: usize) {
+        self.irq_state.lower_tpr(tpr_value);
+    }
+
+    /// Sends an IPI message to multiple CPUs.
+    ///
+    /// * `target_set` - The set of CPUs to which to send the IPI.
+    /// * `ipi_message` - The message to send.
+    pub fn send_multicast_ipi<M: IpiMessage + Sync>(
+        &self,
+        target_set: IpiTarget<'_>,
+        ipi_message: &M,
+    ) {
+        let mut ipi_helper = IpiHelperShared::new(ipi_message);
+        send_ipi(
+            target_set,
+            self.shared.cpu_index,
+            &mut ipi_helper,
+            &self.shared_global().ipi_board,
+        );
+    }
+
+    /// Sends an IPI message to a single CPU.  Because only a single CPU can
+    /// receive the message, the message object can be mutable.
+    ///
+    /// # Arguments
+    /// * `cpu_index` - The index of the CPU to receive the message.
+    /// * `ipi_message` - The message to send.
+    pub fn send_unicast_ipi<M: IpiMessageMut>(&self, cpu_index: usize, ipi_message: &mut M) {
+        let mut ipi_helper = IpiHelperMut::new(ipi_message);
+        send_ipi(
+            IpiTarget::Single(cpu_index),
+            self.shared.cpu_index,
+            &mut ipi_helper,
+            &self.shared_global().ipi_board,
+        );
+    }
+
+    /// Handles an IPI interrupt.
+    pub fn handle_ipi_interrupt(&self) {
+        handle_ipi_interrupt(&self.shared.ipi_requests);
     }
 
     /// Sets up the CPU-local GHCB page.
@@ -406,8 +581,36 @@ impl PerCpu {
         self.ghcb.get()
     }
 
+    /// Allocates hypercall input/output pages for this CPU.
+    pub fn allocate_hypercall_pages(&self) -> Result<(), SvsmError> {
+        let vaddr = allocate_pages(2)?;
+        let pages = (
+            VirtPhysPair::new(vaddr),
+            VirtPhysPair::new(vaddr + PAGE_SIZE),
+        );
+        *self.hypercall_pages.borrow_mut() = Some(pages);
+        Ok(())
+    }
+
+    pub fn get_hypercall_pages(&self) -> HypercallPagesGuard<'_> {
+        // The hypercall page cell is never mutated, but is borrowed mutably
+        // to ensure that only a single reference can ever be taken at a time.
+        let page_ref: RefMut<'_, Option<(VirtPhysPair, VirtPhysPair)>> =
+            self.hypercall_pages.borrow_mut();
+        // SAFETY: the virtual addresses were allocated when the hypercall
+        // pages were configured, and the physical addresses were captured at
+        // that time.
+        unsafe { HypercallPagesGuard::new(RefMut::map(page_ref, |o| o.as_mut().unwrap())) }
+    }
+
     pub fn hv_doorbell(&self) -> Option<&'static HVDoorbell> {
         self.hv_doorbell.get()
+    }
+
+    pub fn process_hv_events_if_required(&self) {
+        if let Some(doorbell) = self.hv_doorbell.get() {
+            doorbell.process_if_required(&self.irq_state);
+        }
     }
 
     /// Gets a pointer to the location of the HV doorbell pointer in the
@@ -417,16 +620,28 @@ impl PerCpu {
         self.hv_doorbell.as_ptr().cast()
     }
 
-    pub fn get_top_of_stack(&self) -> VirtAddr {
-        self.init_stack.get().unwrap()
+    pub fn get_top_of_shadow_stack(&self) -> VirtAddr {
+        self.init_shadow_stack.get().unwrap()
+    }
+
+    pub fn get_top_of_context_switch_stack(&self) -> VirtAddr {
+        self.context_switch_stack.get().unwrap()
     }
 
     pub fn get_top_of_df_stack(&self) -> VirtAddr {
         self.ist.double_fault_stack.get().unwrap()
     }
 
+    pub fn get_top_of_df_shadow_stack(&self) -> VirtAddr {
+        self.ist.double_fault_shadow_stack.get().unwrap()
+    }
+
     pub fn get_current_stack(&self) -> MemoryRegion<VirtAddr> {
         self.current_stack.get()
+    }
+
+    pub fn set_current_stack(&self, stack: MemoryRegion<VirtAddr>) {
+        self.current_stack.set(stack);
     }
 
     pub fn get_apic_id(&self) -> u32 {
@@ -434,7 +649,11 @@ impl PerCpu {
     }
 
     pub fn init_page_table(&self, pgtable: PageBox<PageTable>) -> Result<(), SvsmError> {
-        self.vm_range.initialize()?;
+        // SAFETY: The per-CPU address range is fully aligned to top-level
+        // paging boundaries.
+        unsafe {
+            self.vm_range.initialize()?;
+        }
         self.set_pgtable(PageBox::leak(pgtable));
 
         Ok(())
@@ -454,15 +673,52 @@ impl PerCpu {
         Ok(top_of_stack)
     }
 
-    fn allocate_init_stack(&self) -> Result<(), SvsmError> {
-        let init_stack = Some(self.allocate_stack(SVSM_STACKS_INIT_TASK)?);
-        self.init_stack.set(init_stack);
+    fn allocate_shadow_stack(
+        &self,
+        base: VirtAddr,
+        init: ShadowStackInit,
+    ) -> Result<VirtAddr, SvsmError> {
+        let (shadow_stack, ssp) = VMKernelShadowStack::new(base, init)?;
+        self.vm_range
+            .insert_at(base, Arc::new(Mapping::new(shadow_stack)))?;
+        Ok(ssp)
+    }
+
+    fn allocate_init_shadow_stack(&self) -> Result<(), SvsmError> {
+        let init_stack =
+            Some(self.allocate_shadow_stack(SVSM_SHADOW_STACKS_INIT_TASK, ShadowStackInit::Init)?);
+        self.init_shadow_stack.set(init_stack);
+        Ok(())
+    }
+
+    fn allocate_context_switch_stack(&self) -> Result<(), SvsmError> {
+        let cs_stack = Some(self.allocate_stack(SVSM_CONTEXT_SWITCH_STACK)?);
+        self.context_switch_stack.set(cs_stack);
+        Ok(())
+    }
+
+    fn allocate_context_switch_shadow_stack(&self) -> Result<(), SvsmError> {
+        self.allocate_shadow_stack(
+            SVSM_CONTEXT_SWITCH_SHADOW_STACK,
+            ShadowStackInit::ContextSwitch,
+        )?;
         Ok(())
     }
 
     fn allocate_ist_stacks(&self) -> Result<(), SvsmError> {
         let double_fault_stack = self.allocate_stack(SVSM_STACK_IST_DF_BASE)?;
         self.ist.double_fault_stack.set(Some(double_fault_stack));
+
+        Ok(())
+    }
+
+    fn allocate_isst_shadow_stacks(&self) -> Result<(), SvsmError> {
+        let double_fault_shadow_stack =
+            self.allocate_shadow_stack(SVSM_SHADOW_STACK_ISST_DF_BASE, ShadowStackInit::Exception)?;
+        self.ist
+            .double_fault_shadow_stack
+            .set(Some(double_fault_shadow_stack));
+
         Ok(())
     }
 
@@ -509,9 +765,17 @@ impl PerCpu {
 
     fn setup_tss(&self) {
         let double_fault_stack = self.get_top_of_df_stack();
-        let mut tss = self.tss.get();
-        tss.set_ist_stack(IST_DF, double_fault_stack);
-        self.tss.set(tss);
+        // SAFETY: the stck pointer is known to be correct.
+        unsafe {
+            self.tss.set_ist_stack(IST_DF, double_fault_stack);
+        }
+    }
+
+    fn setup_isst(&self) {
+        let double_fault_shadow_stack = self.get_top_of_df_shadow_stack();
+        let mut isst = self.isst.get();
+        isst.set(IST_DF, double_fault_shadow_stack);
+        self.isst.set(isst);
     }
 
     pub fn map_self_stage2(&self) -> Result<(), SvsmError> {
@@ -565,14 +829,30 @@ impl PerCpu {
         // Reserve ranges for temporary mappings
         self.initialize_vm_ranges()?;
 
-        // Allocate per-cpu init stack
-        self.allocate_init_stack()?;
+        if is_cet_ss_supported() {
+            self.allocate_init_shadow_stack()?;
+        }
+
+        // Allocate per-cpu context switch stack
+        self.allocate_context_switch_stack()?;
+
+        if is_cet_ss_supported() {
+            self.allocate_context_switch_shadow_stack()?;
+        }
 
         // Allocate IST stacks
         self.allocate_ist_stacks()?;
 
         // Setup TSS
         self.setup_tss();
+
+        if is_cet_ss_supported() {
+            // Allocate ISST shadow stacks
+            self.allocate_isst_shadow_stacks()?;
+
+            // Setup ISST
+            self.setup_isst();
+        }
 
         // Initialize allocator for temporary mappings
         self.virt_range_init();
@@ -591,33 +871,76 @@ impl PerCpu {
     }
 
     pub fn setup_idle_task(&self, entry: extern "C" fn()) -> Result<(), SvsmError> {
-        let idle_task = Task::create(self, entry)?;
+        let idle_task = Task::create(self, entry, String::from("idle"))?;
         self.runqueue.lock_read().set_idle_task(idle_task);
         Ok(())
     }
 
-    pub fn load_pgtable(&self) {
-        self.get_pgtable().load();
+    pub fn load_gdt_tss(&'static self, init_gdt: bool) {
+        // Create a temporary GDT to use to configure the TSS.
+        let mut gdt = GDT::new();
+        gdt.load();
+        // Load the GDT selectors if requested.
+        if init_gdt {
+            gdt.load_selectors();
+        }
+        gdt.load_tss(&self.tss);
     }
 
-    pub fn load_tss(&self) {
-        // SAFETY: this can only produce UB if someone else calls self.tss.set
-        // () while this new reference is alive, which cannot happen as this
-        // data is local to this CPU. We need to get a reference to the value
-        // inside the Cell because the address of the TSS will be used. If we
-        // did self.tss.get(), then the address of a temporary copy would be
-        // used.
-        let tss = unsafe { &*self.tss.as_ptr() };
-        gdt_mut().load_tss(tss);
+    pub fn load_isst(&self) {
+        let isst = self.isst.as_ptr();
+        // SAFETY: ISST is already setup when this is called.
+        unsafe { write_msr(ISST_ADDR, isst as u64) };
     }
 
-    pub fn load(&self) {
-        self.load_pgtable();
-        self.load_tss();
+    pub fn load(&'static self) {
+        // SAFETY: along with the page table we are also uploading the right
+        // TSS and ISST to ensure a memory safe execution state
+        unsafe { self.get_pgtable().load() };
+        self.load_gdt_tss(false);
+        if is_cet_ss_supported() {
+            self.load_isst();
+        }
     }
 
     pub fn set_reset_ip(&self, reset_ip: u64) {
         self.reset_ip.set(reset_ip);
+    }
+
+    /// Fill in the initial context structure for the SVSM.
+    pub fn get_initial_context(&self, start_rip: u64) -> hyperv::HvInitialVpContext {
+        let data_segment = svsm_data_segment();
+
+        hyperv::HvInitialVpContext {
+            rip: start_rip,
+            // Use the context switch stack as its initial stack. This stack
+            // will later serve as the transitory stack during context
+            // switching. It is accessible after switching to the first task's
+            // page table because it resides in the PerCpu virtual range.
+            //
+            // See switch_to() for details.
+            rsp: self.get_top_of_context_switch_stack().into(),
+            rflags: 2,
+
+            cs: svsm_code_segment(),
+            ss: data_segment,
+            ds: data_segment,
+            es: data_segment,
+            fs: data_segment,
+            gs: data_segment,
+            tr: self.svsm_tr_segment(),
+
+            gdtr: svsm_gdt_segment(),
+            idtr: svsm_idt_segment(),
+
+            cr0: read_cr0().bits(),
+            cr3: self.get_pgtable().cr3_value().into(),
+            cr4: read_cr4().bits(),
+            efer: read_efer().bits(),
+            pat: 0x0007040600070406u64,
+
+            ..Default::default()
+        }
     }
 
     /// Allocates and initializes a new VMSA for this CPU. Returns its
@@ -629,15 +952,12 @@ impl PerCpu {
             return Err(SvsmError::Mem);
         }
 
-        let mut vmsa = VmsaPage::new(RMPFlags::GUEST_VMPL)?;
+        let mut vmsa = VmsaPage::new(RMPFlags::VMPL1)?;
         let paddr = vmsa.paddr();
 
         // Initialize VMSA
-        init_svsm_vmsa(&mut vmsa, vtom);
-        vmsa.tr = self.vmsa_tr_segment();
-        vmsa.rip = start_rip;
-        vmsa.rsp = self.get_top_of_stack().into();
-        vmsa.cr3 = self.get_pgtable().cr3_value().into();
+        let context = self.get_initial_context(start_rip);
+        init_svsm_vmsa(&mut vmsa, vtom, &context);
         vmsa.enable();
 
         let sev_features = vmsa.sev_features;
@@ -770,10 +1090,10 @@ impl PerCpu {
         Ok(())
     }
 
-    fn vmsa_tr_segment(&self) -> VMSASegment {
-        VMSASegment {
+    fn svsm_tr_segment(&self) -> hyperv::HvSegmentRegister {
+        hyperv::HvSegmentRegister {
             selector: SVSM_TSS,
-            flags: SVSM_TR_FLAGS,
+            attributes: SVSM_TR_ATTRIBUTES,
             limit: TSS_LIMIT as u32,
             base: &raw const self.tss as u64,
         }
@@ -832,19 +1152,17 @@ impl PerCpu {
         // be received will always observe that there is a current task and
         // not the boot thread.
         if SVSM_PLATFORM.use_interrupts() {
-            unsafe {
-                self.irq_state.set_restore_state(true);
-            }
+            self.irq_state.set_restore_state(true);
         }
         let task = self.runqueue.lock_write().schedule_init();
-        self.current_stack.set(task.stack_bounds());
+        self.set_current_stack(task.stack_bounds());
         task
     }
 
     pub fn schedule_prepare(&self) -> Option<(TaskPointer, TaskPointer)> {
         let ret = self.runqueue.lock_write().schedule_prepare();
         if let Some((_, ref next)) = ret {
-            self.current_stack.set(next.stack_bounds());
+            self.set_current_stack(next.stack_bounds());
         };
         ret
     }
@@ -857,10 +1175,15 @@ impl PerCpu {
         self.runqueue.lock_read().current_task()
     }
 
-    pub fn set_tss_rsp0(&self, addr: VirtAddr) {
-        let mut tss = self.tss.get();
-        tss.stacks[0] = addr;
-        self.tss.set(tss);
+    /// # Safety
+    /// No checks are performed on the stack address.  The caller must
+    /// ensure that the address is valid for stack usage.
+    pub unsafe fn set_tss_rsp0(&self, addr: VirtAddr) {
+        // SAFETY: the caller has guaranteed the correctness of the stack
+        // pointer.
+        unsafe {
+            self.tss.set_rsp0(addr);
+        }
     }
 }
 
@@ -875,24 +1198,20 @@ pub fn this_cpu_shared() -> &'static PerCpuShared {
 /// Disables IRQs on the current CPU. Keeps track of the nesting level and
 /// the original IRQ state.
 ///
-/// # Safety
-///
 /// Caller needs to make sure to match every `irqs_disable()` call with an
 /// `irqs_enable()` call.
 #[inline(always)]
-pub unsafe fn irqs_disable() {
+pub fn irqs_disable() {
     this_cpu().irqs_disable();
 }
 
 /// Reduces IRQ-disable nesting level on the current CPU and restores the
 /// original IRQ state when the level reaches 0.
 ///
-/// # Safety
-///
 /// Caller needs to make sure to match every `irqs_disable()` call with an
 /// `irqs_enable()` call.
 #[inline(always)]
-pub unsafe fn irqs_enable() {
+pub fn irqs_enable() {
     this_cpu().irqs_enable();
 }
 
@@ -901,8 +1220,30 @@ pub unsafe fn irqs_enable() {
 /// # Returns
 ///
 /// Current nesting depth of irq_disable() calls.
-pub fn irq_nesting_count() -> isize {
+pub fn irq_nesting_count() -> i32 {
     this_cpu().irq_nesting_count()
+}
+
+/// Raises TPR on the current CPU.  Keeps track of the nesting level.
+///
+/// The caller must ensure that every `raise_tpr()` call is followed by a
+/// matching call to `lower_tpr()`.
+#[inline(always)]
+pub fn raise_tpr(tpr_value: usize) {
+    this_cpu().raise_tpr(tpr_value);
+}
+
+/// Lowers TPR from the current level to the new level required by the
+/// current nesting state.
+///
+/// The caller must ensure that a `lower_tpr()` call balances a preceding
+/// `raise_tpr()` call to the indicated level.
+///
+/// * `tpr_value` - The TPR from which the caller would like to lower.
+///   Must be less than or equal to the current TPR.
+#[inline(always)]
+pub fn lower_tpr(tpr_value: usize) {
+    this_cpu().lower_tpr(tpr_value);
 }
 
 /// Gets the GHCB for this CPU.
@@ -918,16 +1259,16 @@ pub fn current_ghcb() -> &'static GHCB {
 #[derive(Debug, Clone, Copy)]
 pub struct VmsaRegistryEntry {
     pub paddr: PhysAddr,
-    pub apic_id: u32,
+    pub cpu_index: usize,
     pub guest_owned: bool,
     pub in_use: bool,
 }
 
 impl VmsaRegistryEntry {
-    pub const fn new(paddr: PhysAddr, apic_id: u32, guest_owned: bool) -> Self {
+    pub const fn new(paddr: PhysAddr, cpu_index: usize, guest_owned: bool) -> Self {
         VmsaRegistryEntry {
             paddr,
-            apic_id,
+            cpu_index,
             guest_owned,
             in_use: false,
         }
@@ -959,7 +1300,7 @@ impl PerCpuVmsas {
     pub fn register(
         &self,
         paddr: PhysAddr,
-        apic_id: u32,
+        cpu_index: usize,
         guest_owned: bool,
     ) -> Result<(), SvsmError> {
         let mut guard = self.vmsas.lock_write();
@@ -967,18 +1308,18 @@ impl PerCpuVmsas {
             return Err(SvsmError::InvalidAddress);
         }
 
-        guard.push(VmsaRegistryEntry::new(paddr, apic_id, guest_owned));
+        guard.push(VmsaRegistryEntry::new(paddr, cpu_index, guest_owned));
         Ok(())
     }
 
-    pub fn set_used(&self, paddr: PhysAddr) -> Option<u32> {
+    pub fn set_used(&self, paddr: PhysAddr) -> Option<usize> {
         self.vmsas
             .lock_write()
             .iter_mut()
             .find(|vmsa| vmsa.paddr == paddr && !vmsa.in_use)
             .map(|vmsa| {
                 vmsa.in_use = true;
-                vmsa.apic_id
+                vmsa.cpu_index
             })
     }
 
@@ -992,13 +1333,7 @@ impl PerCpuVmsas {
         if in_use {
             let vmsa = &guard[index];
 
-            if vmsa.apic_id == 0 {
-                return Err(0);
-            }
-
-            let target_cpu = PERCPU_AREAS
-                .get(vmsa.apic_id)
-                .expect("Invalid APIC-ID in VMSA registry");
+            let target_cpu = PERCPU_AREAS.get_by_cpu_index(vmsa.cpu_index);
             target_cpu.clear_guest_vmsa_if_match(paddr);
         }
 
@@ -1024,4 +1359,35 @@ pub fn process_requests() {
 
 pub fn current_task() -> TaskPointer {
     this_cpu().runqueue.lock_read().current_task()
+}
+
+#[no_mangle]
+pub extern "C" fn cpu_idle_loop() {
+    // Start request processing on this CPU if required.
+    if SVSM_PLATFORM.start_svsm_request_loop() {
+        // Start request processing on this CPU.
+        let apic_id = this_cpu().get_apic_id();
+        let processing_name = format!("request-processing on CPU {}", apic_id);
+        start_kernel_task(request_processing_main, processing_name)
+            .expect("Failed to launch request processing task");
+        let loop_name = format!("request-loop on CPU {}", apic_id);
+        start_kernel_task(request_loop_main, loop_name)
+            .expect("Failed to launch request loop task");
+    }
+
+    loop {
+        // Go idle
+        halt();
+
+        // If idle was explicitly requested by another task, then schedule that
+        // task to execute again in case it wants to perform processing as a
+        // result of the wake from idle.
+        let maybe_task = this_cpu().runqueue().lock_write().wake_from_idle();
+        if let Some(task) = maybe_task {
+            schedule_task(task);
+        }
+
+        // Execute any tasks that are currently runnable.
+        schedule();
+    }
 }

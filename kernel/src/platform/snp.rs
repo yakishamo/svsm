@@ -4,33 +4,42 @@
 //
 // Author: Jon Lange <jlange@microsoft.com>
 
+use super::capabilities::Caps;
+use super::snp_fw::{
+    copy_tables_to_fw, launch_fw, prepare_fw_launch, print_fw_meta, validate_fw, validate_fw_memory,
+};
+use super::{PageEncryptionMasks, PageStateChangeOp, PageValidateOp, SvsmPlatform};
 use crate::address::{Address, PhysAddr, VirtAddr};
+use crate::config::SvsmConfig;
 use crate::console::init_svsm_console;
 use crate::cpu::cpuid::{cpuid_table, CpuidResult};
 use crate::cpu::percpu::{current_ghcb, this_cpu, PerCpu};
+use crate::cpu::tlb::TlbFlushScope;
 use crate::error::ApicError::Registration;
 use crate::error::SvsmError;
 use crate::greq::driver::guest_request_driver_init;
 use crate::io::IOPort;
+use crate::mm::memory::write_guest_memory_map;
 use crate::mm::{PerCPUPageMappingGuard, PAGE_SIZE, PAGE_SIZE_2M};
-use crate::platform::{PageEncryptionMasks, PageStateChangeOp, PageValidateOp, SvsmPlatform};
 use crate::sev::ghcb::GHCBIOSize;
 use crate::sev::hv_doorbell::current_hv_doorbell;
 use crate::sev::msr_protocol::{
     hypervisor_ghcb_features, request_termination_msr, verify_ghcb_version, GHCBHvFeatures,
 };
-use crate::sev::status::{sev_restricted_injection, vtom_enabled};
+use crate::sev::status::vtom_enabled;
+use crate::sev::tlb::flush_tlb_scope;
 use crate::sev::{
     init_hypervisor_ghcb_features, pvalidate_range, sev_status_init, sev_status_verify, PvalidateOp,
 };
 use crate::types::PageSize;
 use crate::utils::immut_after_init::ImmutAfterInitCell;
 use crate::utils::MemoryRegion;
-
-#[cfg(debug_assertions)]
-use crate::mm::virt_to_phys;
+use syscall::GlobalFeatureFlags;
 
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+#[cfg(test)]
+use bootlib::platform::SvsmPlatformType;
 
 static SVSM_ENV_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
@@ -76,31 +85,22 @@ pub struct SnpPlatform {
 }
 
 impl SnpPlatform {
-    pub fn new() -> Self {
+    pub fn new(suppress_svsm_interrupts: bool) -> Self {
         Self {
-            can_use_interrupts: false,
+            can_use_interrupts: !suppress_svsm_interrupts,
         }
-    }
-}
-
-impl Default for SnpPlatform {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
 impl SvsmPlatform for SnpPlatform {
+    #[cfg(test)]
+    fn platform_type(&self) -> SvsmPlatformType {
+        SvsmPlatformType::Snp
+    }
+
     fn env_setup(&mut self, _debug_serial_port: u16, vtom: usize) -> Result<(), SvsmError> {
         sev_status_init();
-        VTOM.init(&vtom).map_err(|_| SvsmError::PlatformInit)?;
-
-        // Now that SEV status is initialized, determine whether this platform
-        // supports the use of SVSM interrupts.  SVSM interrupts are supported
-        // if this system uses restricted injection.
-        if sev_restricted_injection() {
-            self.can_use_interrupts = true;
-        }
-
+        VTOM.init(vtom).map_err(|_| SvsmError::PlatformInit)?;
         Ok(())
     }
 
@@ -116,6 +116,30 @@ impl SvsmPlatform for SnpPlatform {
         guest_request_driver_init();
         SVSM_ENV_INITIALIZED.store(true, Ordering::Relaxed);
         Ok(())
+    }
+
+    fn prepare_fw(
+        &self,
+        config: &SvsmConfig<'_>,
+        kernel_region: MemoryRegion<PhysAddr>,
+    ) -> Result<(), SvsmError> {
+        if let Some(fw_meta) = &config.get_fw_metadata() {
+            print_fw_meta(fw_meta);
+            write_guest_memory_map(config)?;
+            validate_fw_memory(config, fw_meta, &kernel_region)?;
+            copy_tables_to_fw(fw_meta, &kernel_region)?;
+            validate_fw(config, &kernel_region)?;
+            prepare_fw_launch(fw_meta)?;
+        }
+        Ok(())
+    }
+
+    fn launch_fw(&self, config: &SvsmConfig<'_>) -> Result<(), SvsmError> {
+        if config.should_launch_fw() {
+            launch_fw(config)
+        } else {
+            Ok(())
+        }
     }
 
     fn setup_percpu(&self, cpu: &PerCpu) -> Result<(), SvsmError> {
@@ -160,6 +184,24 @@ impl SvsmPlatform for SnpPlatform {
                 phys_addr_sizes: processor_capacity.eax,
             }
         }
+    }
+
+    fn determine_cet_support(&self) -> bool {
+        // Examine CPUID information to see whether CET is supported by the
+        // hypervisor.  If no CPUID information is present, then assume that
+        // CET is supported.
+        if let Some(cpuid) = cpuid_table(7) {
+            (cpuid.ecx & 0x80) != 0
+        } else {
+            todo!()
+        }
+    }
+
+    fn capabilities(&self) -> Caps {
+        // VMPL0 is SVSM. VMPL1 to VMPL3 are guest.
+        let vm_bitmap: u64 = 0xE;
+        let features = GlobalFeatureFlags::PLATFORM_TYPE_SNP;
+        Caps::new(vm_bitmap, features)
     }
 
     fn cpuid(&self, eax: u32) -> Option<CpuidResult> {
@@ -207,19 +249,11 @@ impl SvsmPlatform for SnpPlatform {
         region: MemoryRegion<VirtAddr>,
         op: PageValidateOp,
     ) -> Result<(), SvsmError> {
-        #[cfg(debug_assertions)]
-        {
-            // Ensure that it is possible to translate this virtual address to
-            // a physical address.  This is not necessary for correctness
-            // here, but since other platformss may rely on virtual-to-physical
-            // translation, it is helpful to force a translation here for
-            // debugging purposes just to help catch potential errors when
-            // testing on SNP.
-            for va in region.iter_pages(PageSize::Regular) {
-                let _ = virt_to_phys(va);
-            }
-        }
         pvalidate_range(region, PvalidateOp::from(op))
+    }
+
+    fn flush_tlb(&self, flush_scope: &TlbFlushScope) {
+        flush_tlb_scope(flush_scope);
     }
 
     fn configure_alternate_injection(&mut self, alt_inj_requested: bool) -> Result<(), SvsmError> {
@@ -310,6 +344,10 @@ impl SvsmPlatform for SnpPlatform {
         let (vmsa_pa, sev_features) = cpu.alloc_svsm_vmsa(*VTOM as u64, start_rip)?;
 
         current_ghcb().ap_create(vmsa_pa, cpu.get_apic_id().into(), 0, sev_features)
+    }
+
+    fn start_svsm_request_loop(&self) -> bool {
+        true
     }
 }
 

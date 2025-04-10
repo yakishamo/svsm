@@ -2,7 +2,7 @@
 //
 // Copyright (c) 2022-2023 SUSE LLC
 //
-// Authors: Joerg Roedel <jroedel@suse.de>
+// Author: Joerg Roedel <jroedel@suse.de>
 
 use super::super::control_regs::read_cr2;
 use super::super::extable::handle_exception_table;
@@ -11,16 +11,20 @@ use super::super::tss::IST_DF;
 use super::super::vc::handle_vc_exception;
 use super::common::{
     idt_mut, user_mode, IdtEntry, IdtEventType, PageFaultError, AC_VECTOR, BP_VECTOR, BR_VECTOR,
-    CP_VECTOR, DB_VECTOR, DE_VECTOR, DF_VECTOR, GP_VECTOR, HV_VECTOR, INT_INJ_VECTOR, MCE_VECTOR,
-    MF_VECTOR, NMI_VECTOR, NM_VECTOR, NP_VECTOR, OF_VECTOR, PF_VECTOR, SS_VECTOR, SX_VECTOR,
-    TS_VECTOR, UD_VECTOR, VC_VECTOR, XF_VECTOR,
+    CP_VECTOR, DB_VECTOR, DE_VECTOR, DF_VECTOR, GP_VECTOR, HV_VECTOR, INT_INJ_VECTOR, IPI_VECTOR,
+    MCE_VECTOR, MF_VECTOR, NMI_VECTOR, NM_VECTOR, NP_VECTOR, OF_VECTOR, PF_VECTOR, SS_VECTOR,
+    SX_VECTOR, TS_VECTOR, UD_VECTOR, VC_VECTOR, VE_VECTOR, XF_VECTOR,
 };
 use crate::address::VirtAddr;
+use crate::cpu::irq_state::{raw_get_tpr, raw_set_tpr, tpr_from_vector};
 use crate::cpu::registers::RFlags;
+use crate::cpu::shadow_stack::IS_CET_SUPPORTED;
 use crate::cpu::X86ExceptionContext;
 use crate::debug::gdbstub::svsm_gdbstub::handle_debug_exception;
+use crate::mm::GuestPtr;
 use crate::platform::SVSM_PLATFORM;
 use crate::task::{is_task_fault, terminate};
+use crate::tdx::ve::handle_virtualization_exception;
 use core::arch::global_asm;
 
 use crate::syscall::*;
@@ -47,12 +51,14 @@ extern "C" {
     fn asm_entry_ac();
     fn asm_entry_mce();
     fn asm_entry_xf();
+    fn asm_entry_ve();
     fn asm_entry_cp();
     fn asm_entry_hv();
     fn asm_entry_vc();
     fn asm_entry_sx();
     fn asm_entry_int80();
     fn asm_entry_irq_int_inj();
+    fn asm_entry_irq_ipi();
 
     pub static mut HV_DOORBELL_ADDR: usize;
 }
@@ -81,6 +87,7 @@ pub fn early_idt_init() {
     idt.set_entry(AC_VECTOR, IdtEntry::entry(asm_entry_ac));
     idt.set_entry(MCE_VECTOR, IdtEntry::entry(asm_entry_mce));
     idt.set_entry(XF_VECTOR, IdtEntry::entry(asm_entry_xf));
+    idt.set_entry(VE_VECTOR, IdtEntry::entry(asm_entry_ve));
     idt.set_entry(CP_VECTOR, IdtEntry::entry(asm_entry_cp));
     idt.set_entry(HV_VECTOR, IdtEntry::entry(asm_entry_hv));
     idt.set_entry(VC_VECTOR, IdtEntry::entry(asm_entry_vc));
@@ -89,6 +96,7 @@ pub fn early_idt_init() {
 
     // Interupts
     idt.set_entry(0x80, IdtEntry::user_entry(asm_entry_int80));
+    idt.set_entry(IPI_VECTOR, IdtEntry::entry(asm_entry_irq_ipi));
 
     // Load IDT
     idt.load();
@@ -98,6 +106,7 @@ pub fn idt_init() {
     // Set IST vectors
     init_ist_vectors();
 
+    // SAFETY:
     // Capture an address that can be used by assembly code to read the #HV
     // doorbell page.  The address of each CPU's doorbell page may be
     // different, but the address of the field in the PerCpu structure that
@@ -205,6 +214,77 @@ extern "C" fn ex_handler_page_fault(ctxt: &mut X86ExceptionContext, vector: usiz
     }
 }
 
+// Control-Protection handler
+#[no_mangle]
+extern "C" fn ex_handler_control_protection(ctxt: &mut X86ExceptionContext, _vector: usize) {
+    // From AMD64 Architecture Programmer's Manual, Volume 2, 8.4.3
+    // Control-Protection Error Code:
+    /// A RET (near) instruction encountered a return address mismatch.
+    const NEAR_RET: usize = 1;
+    /// A RET (far) or IRET instruction encountered a return address mismatch.
+    const FAR_RET_IRET: usize = 2;
+    /// An RSTORSSP instruction encountered an invalid shadow stack restore
+    /// token.
+    const RSTORSSP: usize = 4;
+    /// A SETSSBSY instruction encountered an invalid supervisor shadow stack
+    /// token.
+    const SETSSBSY: usize = 5;
+
+    let rip = ctxt.frame.rip;
+    match ctxt.error_code & 0x7fff {
+        code @ (NEAR_RET | FAR_RET_IRET) => {
+            // Read the return address on the normal stack.
+            let ret_ptr: GuestPtr<u64> = GuestPtr::new(VirtAddr::from(ctxt.frame.rsp));
+            // SAFETY: `rsp` is a valid guest address filled by the CPU in the
+            // X86InterruptFrame
+            let ret = unsafe { ret_ptr.read() }.expect("Failed to read return address");
+
+            // Read the return address on the shadow stack.
+            let prev_rssp_ptr: GuestPtr<u64> = GuestPtr::new(VirtAddr::from(ctxt.ssp));
+            // SAFETY: `ssp` is a valid guest address filled by the CPU in the
+            // X86ExceptionContext
+            let prev_rssp = unsafe { prev_rssp_ptr.read() }
+                .expect("Failed to read address of previous shadow stack pointer");
+            // The offset to the return pointer is different for RET and IRET.
+            let offset = if code == NEAR_RET { 0 } else { 8 };
+            let ret_ptr: GuestPtr<u64> = GuestPtr::new(VirtAddr::from(prev_rssp + offset));
+            let ret_on_ssp =
+                // SAFETY: `ssp` is a valid guest address filled by the CPU in the
+                // X86ExceptionContext
+                unsafe { ret_ptr.read() }.expect("Failed to read return address on shadow stack");
+
+            panic!("thread at {rip:#018x} tried to return to {ret:#x}, but return address on shadow stack was {ret_on_ssp:#x}!");
+        }
+        RSTORSSP => {
+            panic!("rstorssp instruction encountered an unexpected shadow stack restore token at RIP {rip:#018x}");
+        }
+        SETSSBSY => {
+            panic!("setssbsy instruction encountered an unexpected supervisor shadow stack token at RIP {rip:#018x}");
+        }
+        code => unreachable!("unexpected code for #CP exception: {code}"),
+    }
+}
+
+// Virtualization Exception handler
+#[no_mangle]
+extern "C" fn ex_handler_ve(ctxt: &mut X86ExceptionContext) {
+    let rip = ctxt.frame.rip;
+    let code = ctxt.error_code;
+
+    if let Err(err) = handle_virtualization_exception(ctxt) {
+        log::error!("#VE handling error: {:?}", err);
+        if user_mode(ctxt) {
+            log::error!("Failed to handle #VE from user-mode at RIP {:#018x} code: {:#018x} - Terminating task", rip, code);
+            terminate();
+        } else {
+            panic!(
+                "Failed to handle #VE from kernel-mode at RIP {:#018x} code: {:#018x}",
+                rip, code
+            );
+        }
+    }
+}
+
 // VMM Communication handler
 #[no_mangle]
 extern "C" fn ex_handler_vmm_communication(ctxt: &mut X86ExceptionContext, vector: usize) {
@@ -247,10 +327,26 @@ extern "C" fn ex_handler_system_call(
     };
 
     ctxt.regs.rax = match input {
-        SYS_HELLO => sys_hello(),
-        SYS_EXIT => sys_exit(),
-        _ => !0,
-    };
+        // Class 0 SysCalls.
+        SYS_EXIT => sys_exit(ctxt.regs.rdi as u32),
+        SYS_EXEC => sys_exec(ctxt.regs.rdi, ctxt.regs.rsi, ctxt.regs.r8),
+        SYS_CLOSE => sys_close(ctxt.regs.rdi as u32),
+        // Class 1 SysCalls.
+        SYS_OPEN => sys_open(ctxt.regs.rdi, ctxt.regs.rsi, ctxt.regs.r8),
+        SYS_READ => sys_read(ctxt.regs.rdi as u32, ctxt.regs.rsi, ctxt.regs.r8),
+        SYS_WRITE => sys_write(ctxt.regs.rdi as u32, ctxt.regs.rsi, ctxt.regs.r8),
+        SYS_SEEK => sys_seek(ctxt.regs.rdi as u32, ctxt.regs.rsi, ctxt.regs.r8),
+        SYS_UNLINK => sys_unlink(ctxt.regs.rdi),
+        SYS_TRUNCATE => sys_truncate(ctxt.regs.rdi as u32, ctxt.regs.rsi),
+        SYS_OPENDIR => sys_opendir(ctxt.regs.rdi),
+        SYS_READDIR => sys_readdir(ctxt.regs.rdi as u32, ctxt.regs.rsi, ctxt.regs.r8),
+        SYS_MKDIR => sys_mkdir(ctxt.regs.rdi),
+        SYS_RMDIR => sys_rmdir(ctxt.regs.rdi),
+        // Class 3 SysCalls.
+        SYS_CAPABILITIES => sys_capabilities(ctxt.regs.rdi as u32),
+        _ => Err(SysCallError::EINVAL),
+    }
+    .map_or_else(|e| e as usize, |v| v as usize);
 }
 
 #[no_mangle]
@@ -266,11 +362,50 @@ pub extern "C" fn ex_handler_panic(ctx: &mut X86ExceptionContext, vector: usize)
 }
 
 #[no_mangle]
-pub extern "C" fn common_isr_handler(_vector: usize) {
-    // Interrupt injection requests currently require no processing; they occur
-    // simply to ensure an exit from the guest.
+pub extern "C" fn common_isr_handler_entry(vector: usize) {
+    // Since interrupt handlers execute with interrupts disabled, it is
+    // necessary to increment the per-CPU interrupt disable nesting state
+    // while the handler is running in case common code attempts to disable
+    // interrupts temporarily.  The fact that this interrupt was received
+    // means that the previous state must have had interrupts enabled.
+    let cpu = this_cpu();
+    cpu.irqs_push_nesting(true);
 
-    // Treat any unhandled interrupt as a spurious interrupt.
+    common_isr_handler(vector);
+
+    // Decrement the interrupt disable nesting count, but do not permit
+    // interrupts to be reenabled.  They will be reenabled during the IRET
+    // flow.
+    cpu.irqs_pop_nesting();
+}
+
+pub fn common_isr_handler(vector: usize) {
+    // Set TPR based on the vector being handled and reenable interrupts to
+    // permit delivery of higher priority interrupts.  Because this routine
+    // dispatches interrupts which should only be observable if interrupts
+    // are enabled, the IRQ nesting count must be zero at this point.
+    let previous_tpr = raw_get_tpr();
+    raw_set_tpr(tpr_from_vector(vector));
+
+    let cpu = this_cpu();
+    cpu.irqs_enable();
+
+    // Process the requested interrupt vector.
+    match vector {
+        IPI_VECTOR => this_cpu().handle_ipi_interrupt(),
+        _ => {
+            // Ignore all unrecognized interrupt vectors and treat them as
+            // spurious interrupts.
+        }
+    }
+
+    // Disable interrupts before restoring TPR.
+    cpu.irqs_disable();
+    raw_set_tpr(previous_tpr);
+
+    // Perform the EOI cycle after the interrupt processing state has been
+    // restored so that recurrent interrupts will not introduce recursion at
+    // this point.
     SVSM_PLATFORM.eoi();
 }
 
@@ -283,5 +418,6 @@ global_asm!(
     include_str!("../x86/smap.S"),
     include_str!("entry.S"),
     IF = const RFlags::IF.bits(),
+    IS_CET_SUPPORTED = sym IS_CET_SUPPORTED,
     options(att_syntax)
 );

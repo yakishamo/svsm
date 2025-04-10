@@ -27,6 +27,7 @@ use crate::sev::msr_protocol::GhcbMsrError;
 use crate::sev::SevSnpError;
 use crate::syscall::ObjError;
 use crate::task::TaskError;
+use crate::tdx::TdxError;
 use elf::ElfError;
 use syscall::SysCallError;
 
@@ -58,7 +59,7 @@ pub enum SvsmError {
     /// Errors related to SEV-SNP operations, like PVALIDATE or RMPUPDATE
     SevSnp(SevSnpError),
     /// Errors related to TDX operations
-    Tdx,
+    Tdx(TdxError),
     /// Generic errors related to memory management
     Mem,
     /// Errors related to the memory allocator
@@ -77,6 +78,8 @@ pub enum SvsmError {
     InvalidBytes,
     /// Error reported when converting to UTF-8
     InvalidUtf8,
+    /// A fault occured
+    Fault,
     /// Errors related to firmware parsing
     Firmware,
     /// Errors related to console operation
@@ -97,6 +100,8 @@ pub enum SvsmError {
     NotSupported,
     /// Generic errors related to APIC emulation.
     Apic(ApicError),
+    /// Errors related to Hyper-V.
+    HyperV(u16),
 }
 
 impl From<ElfError> for SvsmError {
@@ -122,6 +127,8 @@ impl From<SvsmError> for SysCallError {
         match err {
             SvsmError::Alloc(AllocError::OutOfMemory) => SysCallError::ENOMEM,
             SvsmError::FileSystem(FsError::FileExists) => SysCallError::EEXIST,
+            SvsmError::FileSystem(FsError::WriteOnly) => SysCallError::EWRONLY,
+            SvsmError::FileSystem(FsError::ReadOnly) => SysCallError::ERDONLY,
 
             SvsmError::FileSystem(FsError::FileNotFound) | SvsmError::Obj(ObjError::NotFound) => {
                 SysCallError::ENOTFOUND

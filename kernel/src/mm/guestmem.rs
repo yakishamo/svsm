@@ -43,7 +43,7 @@ pub fn read_u8(v: VirtAddr) -> Result<u8, SvsmError> {
     if rcx == 0 {
         Ok(ret)
     } else {
-        Err(SvsmError::InvalidAddress)
+        Err(SvsmError::Fault)
     }
 }
 
@@ -80,7 +80,7 @@ pub unsafe fn write_u8(v: VirtAddr, val: u8) -> Result<(), SvsmError> {
     if rcx == 0 {
         Ok(())
     } else {
-        Err(SvsmError::InvalidAddress)
+        Err(SvsmError::Fault)
     }
 }
 
@@ -90,24 +90,26 @@ unsafe fn read_u16(v: VirtAddr) -> Result<u16, SvsmError> {
     let mut rcx: u64;
     let mut val: u64;
 
-    asm!("1: movw ({0}), {1}",
-         "   xorq %rcx, %rcx",
-         "2:",
-         ".pushsection \"__exception_table\",\"a\"",
-         ".balign 16",
-         ".quad (1b)",
-         ".quad (2b)",
-         ".popsection",
-            in(reg) v.bits(),
-            out(reg) val,
-            out("rcx") rcx,
-            options(att_syntax, nostack));
+    unsafe {
+        asm!("1: movw ({0}), {1}",
+             "   xorq %rcx, %rcx",
+             "2:",
+             ".pushsection \"__exception_table\",\"a\"",
+             ".balign 16",
+             ".quad (1b)",
+             ".quad (2b)",
+             ".popsection",
+                in(reg) v.bits(),
+                out(reg) val,
+                out("rcx") rcx,
+                options(att_syntax, nostack));
+    }
 
     let ret: u16 = (val & 0xffff) as u16;
     if rcx == 0 {
         Ok(ret)
     } else {
-        Err(SvsmError::InvalidAddress)
+        Err(SvsmError::Fault)
     }
 }
 
@@ -117,24 +119,26 @@ unsafe fn read_u32(v: VirtAddr) -> Result<u32, SvsmError> {
     let mut rcx: u64;
     let mut val: u64;
 
-    asm!("1: movl ({0}), {1}",
-         "   xorq %rcx, %rcx",
-         "2:",
-         ".pushsection \"__exception_table\",\"a\"",
-         ".balign 16",
-         ".quad (1b)",
-         ".quad (2b)",
-         ".popsection",
-            in(reg) v.bits(),
-            out(reg) val,
-            out("rcx") rcx,
-            options(att_syntax, nostack));
+    unsafe {
+        asm!("1: movl ({0}), {1}",
+             "   xorq %rcx, %rcx",
+             "2:",
+             ".pushsection \"__exception_table\",\"a\"",
+             ".balign 16",
+             ".quad (1b)",
+             ".quad (2b)",
+             ".popsection",
+                in(reg) v.bits(),
+                out(reg) val,
+                out("rcx") rcx,
+                options(att_syntax, nostack));
+    }
 
     let ret: u32 = (val & 0xffffffff) as u32;
     if rcx == 0 {
         Ok(ret)
     } else {
-        Err(SvsmError::InvalidAddress)
+        Err(SvsmError::Fault)
     }
 }
 
@@ -144,49 +148,61 @@ unsafe fn read_u64(v: VirtAddr) -> Result<u64, SvsmError> {
     let mut rcx: u64;
     let mut val: u64;
 
-    asm!("1: movq ({0}), {1}",
-         "   xorq %rcx, %rcx",
-         "2:",
-         ".pushsection \"__exception_table\",\"a\"",
-         ".balign 16",
-         ".quad (1b)",
-         ".quad (2b)",
-         ".popsection",
-            in(reg) v.bits(),
-            out(reg) val,
-            out("rcx") rcx,
-            options(att_syntax, nostack));
-
+    unsafe {
+        asm!("1: movq ({0}), {1}",
+             "   xorq %rcx, %rcx",
+             "2:",
+             ".pushsection \"__exception_table\",\"a\"",
+             ".balign 16",
+             ".quad (1b)",
+             ".quad (2b)",
+             ".popsection",
+                in(reg) v.bits(),
+                out(reg) val,
+                out("rcx") rcx,
+                options(att_syntax, nostack));
+    }
     if rcx == 0 {
         Ok(val)
     } else {
-        Err(SvsmError::InvalidAddress)
+        Err(SvsmError::Fault)
+    }
+}
+
+#[inline]
+unsafe fn copy_bytes(src: usize, dst: usize, size: usize) -> Result<(), SvsmError> {
+    let mut rcx: u64;
+
+    unsafe {
+        asm!("1:cld
+                rep movsb
+              2:
+             .pushsection \"__exception_table\",\"a\"
+             .balign 16
+             .quad (1b)
+             .quad (2b)
+             .popsection",
+                inout("rsi") src => _,
+                inout("rdi") dst => _,
+                inout("rcx") size => rcx,
+                options(att_syntax, nostack));
+    }
+
+    if rcx == 0 {
+        Ok(())
+    } else {
+        Err(SvsmError::Fault)
     }
 }
 
 #[inline]
 unsafe fn do_movsb<T>(src: *const T, dst: *mut T) -> Result<(), SvsmError> {
     let size: usize = size_of::<T>();
-    let mut rcx: u64;
+    let s = src as usize;
+    let d = dst as usize;
 
-    asm!("1:cld
-            rep movsb
-          2:
-         .pushsection \"__exception_table\",\"a\"
-         .balign 16
-         .quad (1b)
-         .quad (2b)
-         .popsection",
-            inout("rsi") src => _,
-            inout("rdi") dst => _,
-            inout("rcx") size => rcx,
-            options(att_syntax, nostack));
-
-    if rcx == 0 {
-        Ok(())
-    } else {
-        Err(SvsmError::InvalidAddress)
-    }
+    // SAFETY: Only safe when safety requirements for do_movsb() are fulfilled.
+    unsafe { copy_bytes(s, d, size) }
 }
 
 #[derive(Debug)]
@@ -269,12 +285,12 @@ impl<T: Copy> InsnMachineMem for GuestPtr<T> {
 
     /// Safety: See the GuestPtr's read() method documentation for safety requirements.
     unsafe fn mem_read(&self) -> Result<Self::Item, InsnError> {
-        self.read().map_err(|_| InsnError::MemRead)
+        unsafe { self.read().map_err(|_| InsnError::MemRead) }
     }
 
     /// Safety: See the GuestPtr's write() method documentation for safety requirements.
     unsafe fn mem_write(&mut self, data: Self::Item) -> Result<(), InsnError> {
-        self.write(data).map_err(|_| InsnError::MemWrite)
+        unsafe { self.write(data).map_err(|_| InsnError::MemWrite) }
     }
 }
 
@@ -369,6 +385,46 @@ impl UserPtr<c_char> {
             }
         }
         Err(SvsmError::InvalidBytes)
+    }
+}
+
+fn check_bounds_user(start: usize, len: usize) -> Result<(), SvsmError> {
+    let end: usize = start.checked_add(len).ok_or(SvsmError::InvalidAddress)?;
+
+    if end > USER_MEM_END.bits() {
+        Err(SvsmError::InvalidAddress)
+    } else {
+        Ok(())
+    }
+}
+
+pub fn copy_from_user(src: VirtAddr, dst: &mut [u8]) -> Result<(), SvsmError> {
+    let source = src.bits();
+    let destination = dst.as_mut_ptr() as usize;
+    let size = dst.len();
+
+    check_bounds_user(source, size)?;
+
+    // SAFETY: Safe because the copy only happens to the memory belonging to
+    // the dst slice from user-mode memory.
+    unsafe {
+        let _guard = UserAccessGuard::new();
+        copy_bytes(source, destination, size)
+    }
+}
+
+pub fn copy_to_user(src: &[u8], dst: VirtAddr) -> Result<(), SvsmError> {
+    let source = src.as_ptr() as usize;
+    let destination = dst.bits();
+    let size = src.len();
+
+    check_bounds_user(destination, size)?;
+
+    // SAFETY: Only reads data from with the slice and copies to an address
+    // guaranteed to be in user-space.
+    unsafe {
+        let _guard = UserAccessGuard::new();
+        copy_bytes(source, destination, size)
     }
 }
 

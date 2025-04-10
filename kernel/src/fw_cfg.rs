@@ -10,9 +10,10 @@ use crate::address::{Address, PhysAddr};
 use crate::error::SvsmError;
 use crate::mm::pagetable::max_phys_addr;
 use crate::utils::MemoryRegion;
+use bootlib::kernel_launch::{STAGE2_MAXLEN, STAGE2_START};
 
 use super::io::IOPort;
-use super::string::FixedString;
+use alloc::string::String;
 use alloc::vec::Vec;
 use core::mem::size_of;
 
@@ -110,8 +111,8 @@ impl<'a> FwCfg<'a> {
         val
     }
 
-    pub fn read_char(&self) -> char {
-        self.driver.inb(FW_CFG_DATA) as char
+    pub fn read_u8(&self) -> u8 {
+        self.driver.inb(FW_CFG_DATA)
     }
 
     pub fn file_selector(&self, name: &str) -> Result<FwCfgFile, SvsmError> {
@@ -126,13 +127,18 @@ impl<'a> FwCfg<'a> {
             let size: u32 = self.read_be();
             let selector: u16 = self.read_be();
             let _unused: u16 = self.read_be();
-            let mut fs = FixedString::<56>::new();
+            let mut st = String::with_capacity(56);
+            let mut terminated = false;
             for _ in 0..56 {
-                let c = self.read_char();
-                fs.push(c);
+                let c = self.read_u8();
+                if terminated || c == b'\0' {
+                    terminated = true;
+                } else {
+                    st.push(c.into());
+                }
             }
 
-            if fs == name {
+            if st == name {
                 return Ok(FwCfgFile { size, selector });
             }
         }
@@ -209,7 +215,7 @@ impl<'a> FwCfg<'a> {
             .or_else(|_| self.find_kernel_region_e820())?;
 
         // Make sure that the kernel region doesn't overlap with the loader.
-        if kernel_region.start() < PhysAddr::from(640 * 1024u64) {
+        if kernel_region.start() < PhysAddr::from(u64::from(STAGE2_START + STAGE2_MAXLEN)) {
             return Err(SvsmError::FwCfg(FwCfgError::KernelRegion));
         }
 

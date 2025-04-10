@@ -142,16 +142,12 @@ pub fn sev_flags() -> SEVStatusFlags {
 pub fn sev_status_init() {
     let status: SEVStatusFlags = read_sev_status();
     SEV_FLAGS
-        .init(&status)
+        .init(status)
         .expect("Already initialized SEV flags");
 }
 
 pub fn vtom_enabled() -> bool {
     sev_flags().contains(SEVStatusFlags::VTOM)
-}
-
-pub fn sev_restricted_injection() -> bool {
-    sev_flags().contains(SEVStatusFlags::REST_INJ)
 }
 
 pub fn sev_status_verify() {

@@ -32,10 +32,10 @@ use alloc::boxed::Box;
 const ENTRY_COUNT: usize = 512;
 
 /// Mask for private page table entry.
-static PRIVATE_PTE_MASK: ImmutAfterInitCell<usize> = ImmutAfterInitCell::new(0);
+static PRIVATE_PTE_MASK: ImmutAfterInitCell<usize> = ImmutAfterInitCell::uninit();
 
 /// Mask for shared page table entry.
-static SHARED_PTE_MASK: ImmutAfterInitCell<usize> = ImmutAfterInitCell::new(0);
+static SHARED_PTE_MASK: ImmutAfterInitCell<usize> = ImmutAfterInitCell::uninit();
 
 /// Maximum physical address supported by the system.
 static MAX_PHYS_ADDR: ImmutAfterInitCell<u64> = ImmutAfterInitCell::uninit();
@@ -47,32 +47,25 @@ static PHYS_ADDR_SIZE: ImmutAfterInitCell<u32> = ImmutAfterInitCell::uninit();
 pub const LAUNCH_VMSA_ADDR: PhysAddr = PhysAddr::new(0xFFFFFFFFF000);
 
 /// Feature mask for page table entry flags.
-static FEATURE_MASK: ImmutAfterInitCell<PTEntryFlags> =
-    ImmutAfterInitCell::new(PTEntryFlags::empty());
+static FEATURE_MASK: ImmutAfterInitCell<PTEntryFlags> = ImmutAfterInitCell::uninit();
 
-/// Re-initializes early paging settings.
-pub fn paging_init_early(platform: &dyn SvsmPlatform) -> ImmutAfterInitResult<()> {
+/// Initializes paging settings.
+pub fn paging_init(platform: &dyn SvsmPlatform, suppress_global: bool) -> ImmutAfterInitResult<()> {
     init_encrypt_mask(platform)?;
 
     let mut feature_mask = PTEntryFlags::all();
-    feature_mask.remove(PTEntryFlags::GLOBAL);
-    FEATURE_MASK.reinit(&feature_mask)
-}
-
-/// Initializes paging settings.
-pub fn paging_init(platform: &dyn SvsmPlatform) -> ImmutAfterInitResult<()> {
-    init_encrypt_mask(platform)?;
-
-    let feature_mask = PTEntryFlags::all();
-    FEATURE_MASK.reinit(&feature_mask)
+    if suppress_global {
+        feature_mask.remove(PTEntryFlags::GLOBAL);
+    }
+    FEATURE_MASK.init(feature_mask)
 }
 
 /// Initializes the encrypt mask.
 fn init_encrypt_mask(platform: &dyn SvsmPlatform) -> ImmutAfterInitResult<()> {
     let masks = platform.get_page_encryption_masks();
 
-    PRIVATE_PTE_MASK.reinit(&masks.private_pte_mask)?;
-    SHARED_PTE_MASK.reinit(&masks.shared_pte_mask)?;
+    PRIVATE_PTE_MASK.init(masks.private_pte_mask)?;
+    SHARED_PTE_MASK.init(masks.shared_pte_mask)?;
 
     let guest_phys_addr_size = (masks.phys_addr_sizes >> 16) & 0xff;
     let host_phys_addr_size = masks.phys_addr_sizes & 0xff;
@@ -85,7 +78,7 @@ fn init_encrypt_mask(platform: &dyn SvsmPlatform) -> ImmutAfterInitResult<()> {
         guest_phys_addr_size
     };
 
-    PHYS_ADDR_SIZE.reinit(&phys_addr_size)?;
+    PHYS_ADDR_SIZE.init(phys_addr_size)?;
 
     // If the C-bit is a physical address bit however, the guest physical
     // address space is effectively reduced by 1 bit.
@@ -93,7 +86,7 @@ fn init_encrypt_mask(platform: &dyn SvsmPlatform) -> ImmutAfterInitResult<()> {
     let effective_phys_addr_size = cmp::min(masks.addr_mask_width, phys_addr_size);
 
     let max_addr = 1 << effective_phys_addr_size;
-    MAX_PHYS_ADDR.reinit(&max_addr)
+    MAX_PHYS_ADDR.init(max_addr)
 }
 
 /// Returns the private encrypt mask value.
@@ -146,7 +139,7 @@ bitflags! {
 
 impl PTEntryFlags {
     pub fn exec() -> Self {
-        Self::PRESENT | Self::GLOBAL | Self::ACCESSED | Self::DIRTY
+        Self::PRESENT | Self::GLOBAL | Self::ACCESSED
     }
 
     pub fn data() -> Self {
@@ -154,11 +147,11 @@ impl PTEntryFlags {
     }
 
     pub fn data_ro() -> Self {
-        Self::PRESENT | Self::GLOBAL | Self::NX | Self::ACCESSED | Self::DIRTY
+        Self::PRESENT | Self::GLOBAL | Self::NX | Self::ACCESSED
     }
 
     pub fn task_exec() -> Self {
-        Self::PRESENT | Self::ACCESSED | Self::DIRTY
+        Self::PRESENT | Self::ACCESSED
     }
 
     pub fn task_data() -> Self {
@@ -166,7 +159,7 @@ impl PTEntryFlags {
     }
 
     pub fn task_data_ro() -> Self {
-        Self::PRESENT | Self::NX | Self::ACCESSED | Self::DIRTY
+        Self::PRESENT | Self::NX | Self::ACCESSED
     }
 }
 
@@ -371,7 +364,7 @@ impl PTEntry {
     /// raw pointer read.  The caller must be certain to calculate the correct
     /// address.
     pub unsafe fn read_pte(vaddr: VirtAddr) -> Self {
-        *vaddr.as_ptr::<Self>()
+        unsafe { *vaddr.as_ptr::<Self>() }
     }
 }
 
@@ -402,7 +395,9 @@ impl PTPage {
     /// The given reference must correspond to a valid previously allocated
     /// page table page.
     unsafe fn free(page: &'static Self) {
-        let _ = PageBox::from_raw(NonNull::from(page));
+        unsafe {
+            let _ = PageBox::from_raw(NonNull::from(page));
+        }
     }
 
     /// Converts a pagetable entry to a mutable reference to a [`PTPage`],
@@ -451,7 +446,7 @@ pub enum Mapping<'a> {
 }
 
 /// A physical address within a page frame
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 pub enum PageFrame {
     Size4K(PhysAddr),
     Size2M(PhysAddr),
@@ -467,7 +462,7 @@ impl PageFrame {
         }
     }
 
-    fn size(&self) -> usize {
+    pub fn size(&self) -> usize {
         match self {
             Self::Size4K(_) => PAGE_SIZE,
             Self::Size2M(_) => PAGE_SIZE_2M,
@@ -494,8 +489,15 @@ pub struct PageTable {
 
 impl PageTable {
     /// Load the current page table into the CR3 register.
-    pub fn load(&self) {
-        write_cr3(self.cr3_value());
+    ///
+    /// # Safety
+    /// The caller must ensure to take other actions to make sure a memory safe
+    /// execution state is warranted (e.g. changing the stack and register state)
+    pub unsafe fn load(&self) {
+        // SAFETY: demanded to the caller
+        unsafe {
+            write_cr3(self.cr3_value());
+        }
     }
 
     /// Get the CR3 register value for the current page table.
@@ -1039,6 +1041,7 @@ impl PageTable {
     /// - `vregion`: The virtual memory region to map.
     /// - `phys`: The starting physical address to map to.
     /// - `flags`: The flags to apply to the mapping.
+    /// - `shared`: Indicates whether the mapping is shared.
     ///
     /// # Returns
     /// A result indicating success or failure ([`SvsmError`]).
@@ -1047,10 +1050,16 @@ impl PageTable {
         vregion: MemoryRegion<VirtAddr>,
         phys: PhysAddr,
         flags: PTEntryFlags,
+        shared: bool,
     ) -> Result<(), SvsmError> {
         for addr in vregion.iter_pages(PageSize::Regular) {
             let offset = addr - vregion.start();
-            self.map_4k(addr, phys + offset, flags)?;
+            let phys_final = if shared {
+                make_shared_address(phys + offset)
+            } else {
+                make_private_address(phys + offset)
+            };
+            self.map_4k(addr, phys_final, flags)?;
         }
         Ok(())
     }
@@ -1071,6 +1080,7 @@ impl PageTable {
     /// - `vregion`: The virtual memory region to map.
     /// - `phys`: The starting physical address to map to.
     /// - `flags`: The flags to apply to the mapping.
+    /// - `shared`: Indicates whether the mapping is shared.
     ///
     /// # Returns
     /// A result indicating success or failure ([`SvsmError`]).
@@ -1079,10 +1089,16 @@ impl PageTable {
         vregion: MemoryRegion<VirtAddr>,
         phys: PhysAddr,
         flags: PTEntryFlags,
+        shared: bool,
     ) -> Result<(), SvsmError> {
         for addr in vregion.iter_pages(PageSize::Huge) {
             let offset = addr - vregion.start();
-            self.map_2m(addr, phys + offset, flags)?;
+            let phys_final = if shared {
+                make_shared_address(phys + offset)
+            } else {
+                make_private_address(phys + offset)
+            };
+            self.map_2m(addr, phys_final, flags)?;
         }
         Ok(())
     }

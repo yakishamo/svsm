@@ -14,9 +14,9 @@ use crate::locking::RWLock;
 use crate::mm::virtualrange::{VIRT_ALIGN_2M, VIRT_ALIGN_4K};
 use crate::mm::PerCPUPageMappingGuard;
 use crate::mm::{valid_phys_address, writable_phys_addr, GuestPtr};
-use crate::protocols::apic::{APIC_PROTOCOL, APIC_PROTOCOL_VERSION_MAX, APIC_PROTOCOL_VERSION_MIN};
+use crate::protocols::apic::{APIC_PROTOCOL_VERSION_MAX, APIC_PROTOCOL_VERSION_MIN};
 use crate::protocols::errors::SvsmReqError;
-use crate::protocols::RequestParams;
+use crate::protocols::{RequestParams, SVSM_APIC_PROTOCOL, SVSM_CORE_PROTOCOL};
 use crate::requests::SvsmCaa;
 use crate::sev::utils::{
     pvalidate, rmp_clear_guest_vmsa, rmp_grant_guest_access, rmp_revoke_guest_access,
@@ -43,7 +43,6 @@ const SVSM_REQ_CORE_WRITE_SHMEM : u32 = 11;
 const SVSM_REQ_CORE_READ_SHMEM : u32 = 12;
 const SVSM_REQ_CORE_NOTHING : u32 = 13;
 
-const CORE_PROTOCOL: u32 = 1;
 const CORE_PROTOCOL_VERSION_MIN: u32 = 1;
 const CORE_PROTOCOL_VERSION_MAX: u32 = 1;
 
@@ -115,11 +114,11 @@ fn core_create_vcpu(params: &RequestParams) -> Result<(), SvsmReqError> {
     }
 
     let target_cpu = PERCPU_AREAS
-        .get(apic_id)
+        .get_by_apic_id(apic_id)
         .ok_or_else(SvsmReqError::invalid_parameter)?;
 
     // Got valid gPAs and APIC ID, register VMSA immediately to avoid races
-    PERCPU_VMSAS.register(paddr, apic_id, true)?;
+    PERCPU_VMSAS.register(paddr, target_cpu.cpu_index(), true)?;
 
     // Time to map the VMSA. No need to clean up the registered VMSA on the
     // error path since this is a fatal error anyway.
@@ -153,7 +152,7 @@ fn core_create_vcpu(params: &RequestParams) -> Result<(), SvsmReqError> {
 
     drop(lock);
 
-    assert!(PERCPU_VMSAS.set_used(paddr) == Some(apic_id));
+    assert!(PERCPU_VMSAS.set_used(paddr) == Some(target_cpu.cpu_index()));
     target_cpu.update_guest_vmsa_caa(paddr, pcaa);
 
     Ok(())
@@ -214,12 +213,12 @@ fn core_query_protocol(params: &mut RequestParams) -> Result<(), SvsmReqError> {
     let version: u32 = (rcx & 0xffff_ffffu64).try_into().unwrap();
 
     let ret_val = match protocol {
-        CORE_PROTOCOL => protocol_supported(
+        SVSM_CORE_PROTOCOL => protocol_supported(
             version,
             CORE_PROTOCOL_VERSION_MIN,
             CORE_PROTOCOL_VERSION_MAX,
         ),
-        APIC_PROTOCOL => {
+        SVSM_APIC_PROTOCOL => {
             // The APIC protocol is only supported if the calling CPU supports
             // alternate injection.
             if this_cpu().use_apic_emulation() {
@@ -320,7 +319,14 @@ fn core_pvalidate_one(entry: u64, flush: &mut bool) -> Result<(), SvsmReqError> 
             // FIXME: This check leaves a window open for the attack described
             // above. Remove the check once OVMF and Linux have been fixed and
             // no longer try to pvalidate MMIO memory.
-            zero_mem_region(vaddr, vaddr + page_size_bytes);
+
+            // SAFETY: paddr is validated at the beginning of the function, and
+            // we trust PerCPUPageMappingGuard::create() to return a valid
+            // vaddr pointing to a mapped region of at least page_size_bytes
+            // size.
+            unsafe {
+                zero_mem_region(vaddr, vaddr + page_size_bytes);
+            }
         } else {
             log::warn!("Not clearing possible read-only page at PA {:#x}", paddr);
         }

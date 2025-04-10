@@ -103,9 +103,9 @@ enum GHCBExitCode {
     AP_CREATE = 0x80000013,
     HV_DOORBELL = 0x8000_0014,
     HV_IPI = 0x8000_0015,
-    CONFIGURE_INT_INJ = 0x8000_0019,
-    DISABLE_ALT_INJ = 0x8000_001A,
-    SPECIFIC_EOI = 0x8000_001B,
+    CONFIGURE_INT_INJ = 0x8000_001B,
+    DISABLE_ALT_INJ = 0x8000_001C,
+    SPECIFIC_EOI = 0x8000_001D,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -141,7 +141,11 @@ impl GhcbPage {
         pvalidate(vaddr, PageSize::Regular, PvalidateOp::Invalid)?;
 
         // Let the Hypervisor take the page back
-        invalidate_page_msr(paddr)?;
+        // SAFETY: we trust virt_to_phys() to return GHCB's physical address
+        // since it panics if vaddr is invalid.
+        unsafe {
+            invalidate_page_msr(paddr)?;
+        }
 
         // Needs guarding for Stage2 GHCB
         if valid_bitmap_valid_addr(paddr) {
@@ -169,10 +173,17 @@ impl Drop for GhcbPage {
             .expect("Could not re-encrypt page");
 
         // Unregister GHCB PA
-        register_ghcb_gpa_msr(PhysAddr::null()).expect("Could not unregister GHCB");
+        // SAFETY: mapping the GHCB at physical address 0 is safe.
+        unsafe {
+            register_ghcb_gpa_msr(PhysAddr::null()).expect("Could not unregister GHCB");
+        }
 
         // Ask the hypervisor to change the page back to the private page state.
-        validate_page_msr(paddr).expect("Could not change page state");
+        // SAFETY: we trust virt_to_phys() to return GHCB's physical address
+        // since it panics if vaddr is invalid.
+        unsafe {
+            validate_page_msr(paddr).expect("Could not change page state");
+        }
 
         // Make page guest-valid
         pvalidate(vaddr, PageSize::Regular, PvalidateOp::Valid).expect("Could not pvalidate page");
@@ -328,7 +339,9 @@ impl GHCB {
         let paddr = virt_to_phys(vaddr);
 
         // Register GHCB GPA
-        Ok(register_ghcb_gpa_msr(paddr)?)
+        // SAFETY: we trust virt_to_phys() to return self's physical address
+        // since it panics if vaddr is invalid.
+        unsafe { Ok(register_ghcb_gpa_msr(paddr)?) }
     }
 
     pub fn clear(&self) {
@@ -377,10 +390,11 @@ impl GHCB {
         // Disable interrupts between writing the MSR and making the GHCB call
         // to prevent reentrant use of the GHCB MSR.
         let guard = IrqGuard::new();
-        write_msr(SEV_GHCB, ghcb_pa);
+        // SAFETY: GHCB is already allocated and setup so this is safe.
         unsafe {
-            raw_vmgexit();
+            write_msr(SEV_GHCB, ghcb_pa);
         }
+        raw_vmgexit();
         drop(guard);
 
         let sw_exit_info_1 = self.get_exit_info_1_valid()?;
@@ -666,9 +680,9 @@ impl GHCB {
     #[inline]
     #[cfg(test)]
     pub fn fill(&self, val: u8) {
+        // SAFETY: All bytes in `Self` are part of an atomic integer type.
+        // This allows us to cast `Self` to a slice of `AtomicU8`s.
         let bytes = unsafe {
-            // SAFETY: All bytes in `Self` are part of an atomic integer type.
-            // This allows us to cast `Self` to a slice of `AtomicU8`s.
             core::slice::from_raw_parts(self as *const _ as *const AtomicU8, size_of::<Self>())
         };
         for byte in bytes {
@@ -690,6 +704,7 @@ pub fn switch_to_vmpl(vmpl: u32) {
         Some(doorbell) => ptr::from_ref(doorbell),
         None => ptr::null(),
     };
+    // SAFETY: FFI call. Parameters and return values are checked.
     unsafe {
         if !switch_to_vmpl_unsafe(ptr, vmpl) {
             panic!("Failed to switch to VMPL {}", vmpl);

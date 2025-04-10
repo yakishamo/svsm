@@ -28,7 +28,7 @@ jobs:
             override: true
             components: rustfmt, rust-src, clippy
 
-      - name: Install Microsoft TPM build dependencies
+      - name: Install TPM 2.0 Reference Implementation build dependencies
         run: sudo apt install -y autoconf autoconf-archive pkg-config build-essential automake
 
       - name: Check that Cargo.lock is up to date
@@ -41,7 +41,7 @@ jobs:
       # ld to work, so build all the objects without performing the
       # final linking step.
       - name: Build
-        run: make FEATURES="default,enable-gdb" bin/svsm-kernel.elf stage1/stage1.o stage1/reset.o
+        run: make FEATURES="default,enable-gdb" STAGE1_RUSTC_ARGS="--emit=obj -C linker=/usr/bin/true" stage1_elf_full stage1_elf_trampoline
 
       - name: Run tests
         run: make test
@@ -56,13 +56,19 @@ jobs:
         uses: actions-rs/cargo@v1
         with:
           command: clippy
-          args: --workspace --exclude igvmbuilder --exclude igvmmeasure --exclude svsm-fuzz --all-features -- -D warnings
+          args: --workspace --exclude igvmbuilder --exclude igvmmeasure --exclude svsm-fuzz --exclude packit --exclude stage1 --all-features -- -D warnings
 
       - name: Clippy on std x86_64-unknown-linux-gnu
         uses: actions-rs/cargo@v1
         with:
           command: clippy
-          args: --workspace --all-features --exclude svsm --exclude svsm-fuzz --target=x86_64-unknown-linux-gnu -- -D warnings
+          args: --workspace --all-features --exclude svsm --exclude svsm-fuzz --exclude packit --exclude stage1 --target=x86_64-unknown-linux-gnu -- -D warnings
+
+      - name: Clippy on stage1
+        uses: actions-rs/cargo@v1
+        with:
+          command: clippy
+          args: --package stage1 --all-features --target=x86_64-unknown-linux-gnu -- -D warnings -C panic=abort
 
       - name: Clippy on svsm-fuzz
         uses: actions-rs/cargo@v1
@@ -76,7 +82,7 @@ jobs:
         uses: actions-rs/cargo@v1
         with:
           command: clippy
-          args: --workspace --all-features --tests --target=x86_64-unknown-linux-gnu -- -D warnings
+          args: --workspace --exclude packit --exclude user* --all-features --tests --target=x86_64-unknown-linux-gnu -- -D warnings
 
       - name: Check documentation
         run: make doc
@@ -100,15 +106,90 @@ jobs:
             override: true
             components: rustfmt
 
-      # The bindings.rs is auto-generated during make, but we are not
-      # building the code with nightly. So we initialize bindings.rs here
-      # for cargo-fmt in the next workflow, otherwise it will fail reporting
-      # that bindings.rs does not exist.
-      - name: Touch libmstpm bindings
-        run: echo "" > libmstpm/src/bindings.rs
+      # release/src/git_version.rs is auto-generated via a build.rs file. Touch
+      # it here to avoid CI failures.
+      - name: Touch release/src/git_version.rs
+        run: echo "" > release/src/git_version.rs
 
       - name: Format doctests
         uses: actions-rs/cargo@v1
         with:
           command: fmt
           args: --all -- --check --config "format_code_in_doc_comments=true"
+
+  # Check for new undocumented unsafe blocks. This is to prevent them from
+  # growing before we add comments for all of them and manage to enable
+  # `clippy::undocumented_unsafe_blocks` lint.
+  #
+  # Progress documented at https://github.com/coconut-svsm/svsm/issues/228.
+  # When we fix that issue, we may remove this pipeline.
+  unsafe-check:
+    name: Check unsafe blocks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          submodules: recursive
+
+      - name: Install specified rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+            toolchain: '1.82.0'
+            target: x86_64-unknown-none
+            profile: minimal
+            override: true
+            components: rustfmt, rust-src, clippy
+
+      - name: Install TPM 2.0 Reference Implementation build dependencies
+        run: sudo apt install -y autoconf autoconf-archive pkg-config build-essential automake
+
+      - name: Build
+        run: make FEATURES="default,enable-gdb" STAGE1_RUSTC_ARGS="--emit=obj -C linker=/usr/bin/true" stage1_elf_full stage1_elf_trampoline
+
+      - name: Clippy with undocumented_unsafe_blocks for PR branch
+        run: |
+          cargo clippy --workspace --all-features --exclude packit --exclude stage1 --exclude svsm-fuzz --exclude igvmbuilder --exclude igvmmeasure --quiet -- -W clippy::undocumented_unsafe_blocks 2> clippy_warnings_pr.txt || ( cat clippy_warnings_pr.txt; exit 1 )
+
+      # Required because after the next checkout everything is removed.
+      - name: Upload PR warnings artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: clippy-warnings-pr
+          path: clippy_warnings_pr.txt
+
+      - name: Checkout base branch
+        uses: actions/checkout@v3
+        with:
+          submodules: recursive
+          ref: ${{ github.event.pull_request.base.sha }}
+
+      - name: Build base branch
+        run: make FEATURES="default,enable-gdb" STAGE1_RUSTC_ARGS="--emit=obj -C linker=/usr/bin/true" stage1_elf_full stage1_elf_trampoline
+
+      - name: Clippy with undocumented_unsafe_blocks for base branch
+        run: |
+          cargo clippy --workspace --all-features --exclude packit --exclude stage1 --exclude svsm-fuzz --exclude igvmbuilder --exclude igvmmeasure --quiet -- -W clippy::undocumented_unsafe_blocks 2> clippy_warnings_base.txt || ( cat clippy_warnings_base.txt; exit 1 )
+
+      - name: Download PR warnings artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: clippy-warnings-pr
+
+      - name: Check new undocumented unsafe blocks
+        run: |
+          PR_WARNINGS=$(grep 'missing a safety comment' clippy_warnings_pr.txt | wc -l)
+          BASE_WARNINGS=$(grep 'missing a safety comment' clippy_warnings_base.txt | wc -l)
+
+          echo "Undocumented unsafe code blocks [PR: $PR_WARNINGS base: $BASE_WARNINGS]"
+
+          if [ "$PR_WARNINGS" -gt "$BASE_WARNINGS" ]; then
+            echo "ERROR: $(($PR_WARNINGS - $BASE_WARNINGS)) new undocumented unsafe code blocks detected in this PR"
+            echo "enabling the clippy::undocumented_unsafe_blocks lint in this way:"
+            echo "$ cargo clippy --workspace --all-features --exclude packit --exclude stage1 --exclude svsm-fuzz \\"
+            echo "  --exclude igvmbuilder --exclude igvmmeasure -- -W clippy::undocumented_unsafe_blocks"
+            echo ""
+            diff --color -u clippy_warnings_base.txt clippy_warnings_pr.txt
+            exit 1
+          fi
+

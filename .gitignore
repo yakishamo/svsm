@@ -3,11 +3,13 @@
 *.elf
 *.swp
 *~
+verus*.log
 /bin/
 /target/
 gen_meta
 stage1/stage1
 stage1/stage1-test
+release/src/git_version.rs
 print-meta
 cbit
 .idea/
