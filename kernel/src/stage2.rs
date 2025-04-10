@@ -9,26 +9,29 @@
 
 pub mod boot_stage2;
 
-use bootlib::kernel_launch::{KernelLaunchInfo, Stage2LaunchInfo};
+use bootlib::kernel_launch::{
+    KernelLaunchInfo, Stage2LaunchInfo, LOWMEM_END, STAGE2_HEAP_END, STAGE2_HEAP_START,
+    STAGE2_START,
+};
 use bootlib::platform::SvsmPlatformType;
 use core::arch::asm;
 use core::panic::PanicInfo;
 use core::ptr::addr_of_mut;
 use core::slice;
+use core::sync::atomic::{AtomicU32, Ordering};
 use cpuarch::snp_cpuid::SnpCpuidTable;
 use elf::ElfError;
 use svsm::address::{Address, PhysAddr, VirtAddr};
 use svsm::config::SvsmConfig;
 use svsm::console::install_console_logger;
 use svsm::cpu::cpuid::{dump_cpuid_table, register_cpuid_table};
-use svsm::cpu::gdt;
+use svsm::cpu::gdt::GLOBAL_GDT;
 use svsm::cpu::idt::stage2::{early_idt_init, early_idt_init_no_ghcb};
 use svsm::cpu::percpu::{this_cpu, PerCpu};
 use svsm::error::SvsmError;
-use svsm::fw_cfg::FwCfg;
 use svsm::igvm_params::IgvmParams;
 use svsm::mm::alloc::{memory_info, print_memory_info, root_mem_init};
-use svsm::mm::pagetable::{paging_init_early, PTEntryFlags, PageTable};
+use svsm::mm::pagetable::{paging_init, PTEntryFlags, PageTable};
 use svsm::mm::validate::{
     init_valid_bitmap_alloc, valid_bitmap_addr, valid_bitmap_set_valid_range,
 };
@@ -40,7 +43,10 @@ use svsm::platform::{
 use svsm::types::{PageSize, PAGE_SIZE, PAGE_SIZE_2M};
 use svsm::utils::{is_aligned, MemoryRegion};
 
+use release::COCONUT_VERSION;
+
 extern "C" {
+    static ap_flag: AtomicU32; // 4-byte aligned
     static mut pgtable: PageTable;
 }
 
@@ -55,11 +61,9 @@ fn setup_stage2_allocator(heap_start: u64, heap_end: u64) {
 
 fn init_percpu(platform: &mut dyn SvsmPlatform) -> Result<(), SvsmError> {
     let bsp_percpu = PerCpu::alloc(0)?;
-    let init_pgtable = unsafe {
-        // SAFETY: pgtable is a static mut and this is the only place where we
-        // get a reference to it.
-        &mut *addr_of_mut!(pgtable)
-    };
+    // SAFETY: pgtable is a static mut and this is the only place where we
+    // get a reference to it.
+    let init_pgtable = unsafe { &mut *addr_of_mut!(pgtable) };
     bsp_percpu.set_pgtable(init_pgtable);
     bsp_percpu.map_self_stage2()?;
     platform.setup_guest_host_comm(bsp_percpu, true);
@@ -74,7 +78,10 @@ fn init_percpu(platform: &mut dyn SvsmPlatform) -> Result<(), SvsmError> {
 /// The caller must ensure that the `PerCpu` is never used again.
 unsafe fn shutdown_percpu() {
     let ptr = SVSM_PERCPU_BASE.as_mut_ptr::<PerCpu>();
-    core::ptr::drop_in_place(ptr);
+    // SAFETY: demanded to the caller
+    unsafe {
+        core::ptr::drop_in_place(ptr);
+    }
 }
 
 fn setup_env(
@@ -82,7 +89,7 @@ fn setup_env(
     platform: &mut dyn SvsmPlatform,
     launch_info: &Stage2LaunchInfo,
 ) {
-    gdt().load();
+    GLOBAL_GDT.load();
     early_idt_init_no_ghcb();
 
     let debug_serial_port = config.debug_serial_port();
@@ -92,13 +99,18 @@ fn setup_env(
         .expect("Early environment setup failed");
 
     let kernel_mapping = FixedAddressMappingRange::new(
-        VirtAddr::from(0x808000u64),
-        VirtAddr::from(launch_info.stage2_end as u64),
-        PhysAddr::from(0x808000u64),
+        VirtAddr::from(u64::from(STAGE2_START)),
+        VirtAddr::from(u64::from(launch_info.stage2_end)),
+        PhysAddr::from(u64::from(STAGE2_START)),
     );
 
+    let cpuid_page = unsafe { &*(launch_info.cpuid_page as *const SnpCpuidTable) };
+    register_cpuid_table(cpuid_page);
+    paging_init(platform, true).expect("Failed to initialize early paging");
+
     // Use the low 640 KB of memory as the heap.
-    let lowmem_region = MemoryRegion::new(VirtAddr::from(0u64), 640 * 1024);
+    let lowmem_region =
+        MemoryRegion::from_addresses(VirtAddr::from(0u64), VirtAddr::from(u64::from(LOWMEM_END)));
     let heap_mapping = FixedAddressMappingRange::new(
         lowmem_region.start(),
         lowmem_region.end(),
@@ -112,13 +124,21 @@ fn setup_env(
         .validate_virtual_page_range(lowmem_region, PageValidateOp::Validate)
         .expect("failed to validate low 640 KB");
 
-    let cpuid_page = unsafe { &*(launch_info.cpuid_page as *const SnpCpuidTable) };
+    // SAFETY: ap_flag is an extern static and this is the only place where we
+    // get a reference to it.
+    unsafe {
+        // Allow APs to proceed as the environment is now ready.
+        //
+        // Although APs use non-atomic loads in the ap_wait_for_env spin loop,
+        // the language and architectural guarantees of this atomic store (e.g.
+        // the compiler cannot move the previous stores past this atomic
+        // store-release, and x86 is a strongly-ordered system) make setting
+        // this flag more deterministic.
+        ap_flag.store(1, Ordering::Release);
+    }
 
-    register_cpuid_table(cpuid_page);
-    paging_init_early(platform).expect("Failed to initialize early paging");
-
-    // Configure the heap to exist from 64 KB to 640 KB.
-    setup_stage2_allocator(0x10000, 0xA0000);
+    // Configure the heap.
+    setup_stage2_allocator(STAGE2_HEAP_START.into(), STAGE2_HEAP_END.into());
 
     init_percpu(platform).expect("Failed to initialize per-cpu area");
 
@@ -175,13 +195,15 @@ fn get_svsm_config(
     launch_info: &Stage2LaunchInfo,
     platform: &dyn SvsmPlatform,
 ) -> Result<SvsmConfig<'static>, SvsmError> {
-    if launch_info.igvm_params == 0 {
-        return Ok(SvsmConfig::FirmwareConfig(FwCfg::new(
-            platform.get_io_port(),
-        )));
-    }
+    let igvm_params = if launch_info.igvm_params == 0 {
+        None
+    } else {
+        Some(IgvmParams::new(VirtAddr::from(
+            launch_info.igvm_params as u64,
+        ))?)
+    };
 
-    IgvmParams::new(VirtAddr::from(launch_info.igvm_params as u64)).map(SvsmConfig::IgvmConfig)
+    Ok(SvsmConfig::new(platform, igvm_params))
 }
 
 /// Loads a single ELF segment and returns its virtual memory region.
@@ -346,11 +368,11 @@ fn prepare_heap(
 }
 
 #[no_mangle]
-pub extern "C" fn stage2_main(launch_info: &Stage2LaunchInfo) {
+pub extern "C" fn stage2_main(launch_info: &Stage2LaunchInfo) -> ! {
     let platform_type = SvsmPlatformType::from(launch_info.platform_type);
 
     init_platform_type(platform_type);
-    let mut platform = SvsmPlatformCell::new(platform_type);
+    let mut platform = SvsmPlatformCell::new(platform_type, true);
 
     let config =
         get_svsm_config(launch_info, &*platform).expect("Failed to get SVSM configuration");
@@ -360,6 +382,8 @@ pub extern "C" fn stage2_main(launch_info: &Stage2LaunchInfo) {
     let kernel_region = config
         .find_kernel_region()
         .expect("Failed to find memory region for SVSM kernel");
+
+    log::info!("SVSM memory region: {kernel_region:#018x}");
 
     init_valid_bitmap_alloc(kernel_region).expect("Failed to allocate valid-bitmap");
 
@@ -372,7 +396,7 @@ pub extern "C" fn stage2_main(launch_info: &Stage2LaunchInfo) {
             .expect("Failed to load kernel ELF");
 
     // Load the IGVM params, if present. Update loaded region accordingly.
-    let (igvm_vregion, igvm_pregion) = if let SvsmConfig::IgvmConfig(ref igvm_params) = config {
+    let (igvm_vregion, igvm_pregion) = if let Some(igvm_params) = config.get_igvm_params() {
         let (igvm_vregion, igvm_pregion) = load_igvm_params(
             launch_info,
             igvm_params,
@@ -404,6 +428,13 @@ pub extern "C" fn stage2_main(launch_info: &Stage2LaunchInfo) {
     )
     .expect("Failed to map and validate heap");
 
+    // Determine whether use of interrupts n the SVSM should be suppressed.
+    // This is required when running SNP under KVM/QEMU.
+    let suppress_svsm_interrupts = match platform_type {
+        SvsmPlatformType::Snp => config.is_qemu(),
+        _ => false,
+    };
+
     // Build the handover information describing the memory layout and hand
     // control to the SVSM kernel.
     let launch_info = KernelLaunchInfo {
@@ -428,6 +459,7 @@ pub extern "C" fn stage2_main(launch_info: &Stage2LaunchInfo) {
         vtom: launch_info.vtom,
         debug_serial_port: config.debug_serial_port(),
         use_alternate_injection: config.use_alternate_injection(),
+        suppress_svsm_interrupts,
         platform_type,
     };
 
@@ -442,7 +474,7 @@ pub extern "C" fn stage2_main(launch_info: &Stage2LaunchInfo) {
     );
     log::info!("  kernel_region_phys_end   = {:#018x}", kernel_region.end());
     log::info!(
-        "  kernel_virtual_base   = {:#018x}",
+        "  kernel_virtual_base      = {:#018x}",
         loaded_kernel_vregion.start()
     );
 
@@ -453,22 +485,21 @@ pub extern "C" fn stage2_main(launch_info: &Stage2LaunchInfo) {
     // Shut down the GHCB
     unsafe {
         shutdown_percpu();
-    }
 
-    unsafe {
         asm!("jmp *%rax",
              in("rax") u64::from(kernel_entry),
-             in("r8") &launch_info,
-             in("r9") valid_bitmap.bits(),
+             in("rdi") &launch_info,
+             in("rsi") valid_bitmap.bits(),
              options(att_syntax))
     };
 
-    panic!("Road ends here!");
+    unreachable!("Road ends here!");
 }
 
 #[panic_handler]
 fn panic(info: &PanicInfo<'_>) -> ! {
-    log::error!("Panic: {}", info);
+    log::error!("Panic! COCONUT-SVSM Version: {}", COCONUT_VERSION);
+    log::error!("Info: {}", info);
     loop {
         platform::halt();
     }

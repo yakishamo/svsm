@@ -15,6 +15,8 @@ pub fn read_msr(msr: u32) -> u64 {
     let eax: u32;
     let edx: u32;
 
+    // SAFETY: Inline assembly to read the specified MSR. It does not change
+    // any state.
     unsafe {
         asm!("rdmsr",
              in("ecx") msr,
@@ -25,10 +27,15 @@ pub fn read_msr(msr: u32) -> u64 {
     (eax as u64) | (edx as u64) << 32
 }
 
-pub fn write_msr(msr: u32, val: u64) {
+/// # Safety
+///
+/// The caller should ensure that the new value in the target MSR doesn't break
+/// memory safety.
+pub unsafe fn write_msr(msr: u32, val: u64) {
     let eax = (val & 0x0000_0000_ffff_ffff) as u32;
     let edx = (val >> 32) as u32;
 
+    // SAFETY: requirements have to be checked by the caller.
     unsafe {
         asm!("wrmsr",
              in("ecx") msr,
@@ -42,6 +49,7 @@ pub fn rdtsc() -> u64 {
     let eax: u32;
     let edx: u32;
 
+    // SAFETY: Inline assembly to read the TSC. It does not change any state.
     unsafe {
         asm!("rdtsc",
              out("eax") eax,
@@ -62,6 +70,8 @@ pub fn rdtscp() -> RdtscpOut {
     let edx: u32;
     let ecx: u32;
 
+    // SAFETY: Inline assembly to read the TSC and PID. It does not change
+    // any state.
     unsafe {
         asm!("rdtscp",
              out("eax") eax,
@@ -77,6 +87,8 @@ pub fn rdtscp() -> RdtscpOut {
 
 pub fn read_flags() -> u64 {
     let rax: u64;
+    // SAFETY: Inline assembly to read the EFLAGS register. It does not change
+    // any state.
     unsafe {
         asm!(
             r#"

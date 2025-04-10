@@ -26,7 +26,9 @@ use zerocopy::IntoBytes;
 use crate::cmd_options::{CmdOptions, Hypervisor};
 use crate::cpuid::SnpCpuidPage;
 use crate::firmware::{parse_firmware, Firmware};
+use crate::paging::construct_init_page_tables;
 use crate::platform::PlatformMask;
+use crate::sipi::add_sipi_stub;
 use crate::stage2_stack::Stage2Stack;
 use crate::vmsa::{construct_native_start_context, construct_start_context, construct_vmsa};
 use crate::GpaMap;
@@ -42,7 +44,8 @@ pub const ANY_NATIVE_COMPATIBILITY_MASK: u32 = NATIVE_COMPATIBILITY_MASK | VSM_C
 // Parameter area indices
 const IGVM_GENERAL_PARAMS_PA: u32 = 0;
 const IGVM_MEMORY_MAP_PA: u32 = 1;
-const IGVM_PARAMETER_COUNT: u32 = 2;
+const IGVM_MADT_PA: u32 = 2;
+const IGVM_PARAMETER_COUNT: u32 = 3;
 
 const _: () = assert!(size_of::<IgvmParamBlock>() as u64 <= PAGE_SIZE_4K);
 const _: () = assert!(size_of::<IgvmGuestContext>() as u64 <= PAGE_SIZE_4K);
@@ -130,7 +133,11 @@ impl IgvmBuilder {
         // Construct a native context object to capture the start context.
         let start_rip = self.gpa_map.stage2_image.get_start();
         let start_rsp = self.gpa_map.stage2_stack.get_end() - size_of::<Stage2Stack>() as u64;
-        let start_context = construct_start_context(start_rip, start_rsp);
+        let start_context = construct_start_context(
+            start_rip,
+            start_rsp,
+            self.gpa_map.init_page_tables.get_start(),
+        );
 
         self.build_directives(&param_block, &start_context)?;
         self.build_initialization()?;
@@ -186,7 +193,9 @@ impl IgvmBuilder {
 
     fn create_param_block(&self) -> Result<IgvmParamBlock, Box<dyn Error>> {
         let param_page_offset = PAGE_SIZE_4K as u32;
-        let memory_map_offset = param_page_offset + PAGE_SIZE_4K as u32;
+        let madt_offset = param_page_offset + PAGE_SIZE_4K as u32;
+        let memory_map_offset = madt_offset + self.gpa_map.madt.get_size() as u32;
+        let kernel_min_size = 0x1000000; // 16 MiB
         let (guest_context_offset, param_area_size) = if self.gpa_map.guest_context.get_size() == 0
         {
             (0, memory_map_offset + PAGE_SIZE_4K as u32)
@@ -216,21 +225,30 @@ impl IgvmBuilder {
             (fw_info, vtom)
         };
 
+        let is_qemu: u8 = match self.options.hypervisor {
+            Hypervisor::Qemu => 1,
+            _ => 0,
+        };
+
         // Most of the parameter block can be initialised with constants.
         Ok(IgvmParamBlock {
             param_area_size,
             param_page_offset,
             memory_map_offset,
+            madt_offset,
+            madt_size: self.gpa_map.madt.get_size().try_into().unwrap(),
             guest_context_offset,
             debug_serial_port: self.options.get_port_address(),
             firmware: fw_info,
             stage1_size: self.gpa_map.stage1_image.get_size() as u32,
             stage1_base: self.gpa_map.stage1_image.get_start(),
             kernel_reserved_size: PAGE_SIZE_4K as u32, // Reserved for VMSA
-            kernel_size: self.gpa_map.kernel.get_size() as u32,
             kernel_base: self.gpa_map.kernel.get_start(),
+            kernel_min_size,
+            kernel_max_size: self.gpa_map.kernel.get_size() as u32,
             vtom,
             use_alternate_injection: u8::from(self.options.alt_injection),
+            is_qemu,
             ..Default::default()
         })
     }
@@ -313,19 +331,37 @@ impl IgvmBuilder {
         }
 
         // Describe the kernel RAM region
-        self.directives.push(IgvmDirectiveHeader::RequiredMemory {
-            gpa: param_block.kernel_base,
-            compatibility_mask: COMPATIBILITY_MASK.get(),
-            number_of_bytes: param_block.kernel_size,
-            vtl2_protectable: false,
-        });
+        if COMPATIBILITY_MASK.contains(!VSM_COMPATIBILITY_MASK) {
+            self.directives.push(IgvmDirectiveHeader::RequiredMemory {
+                gpa: param_block.kernel_base,
+                compatibility_mask: COMPATIBILITY_MASK.get() & !VSM_COMPATIBILITY_MASK,
+                number_of_bytes: param_block.kernel_min_size,
+                vtl2_protectable: false,
+            });
+        }
 
-        // Create the two parameter areas for memory map and general parameters.
+        if COMPATIBILITY_MASK.contains(VSM_COMPATIBILITY_MASK) {
+            self.directives.push(IgvmDirectiveHeader::RequiredMemory {
+                gpa: param_block.kernel_base,
+                compatibility_mask: VSM_COMPATIBILITY_MASK,
+                number_of_bytes: param_block.kernel_min_size,
+                vtl2_protectable: true,
+            });
+        }
+
+        // Create the parameter areas for all host-supplied parameters.
         self.directives.push(IgvmDirectiveHeader::ParameterArea {
             number_of_bytes: PAGE_SIZE_4K,
             parameter_area_index: IGVM_MEMORY_MAP_PA,
             initial_data: vec![],
         });
+        if self.gpa_map.madt.get_size() != 0 {
+            self.directives.push(IgvmDirectiveHeader::ParameterArea {
+                number_of_bytes: PAGE_SIZE_4K,
+                parameter_area_index: IGVM_MADT_PA,
+                initial_data: vec![],
+            });
+        }
         self.directives.push(IgvmDirectiveHeader::ParameterArea {
             number_of_bytes: PAGE_SIZE_4K,
             parameter_area_index: IGVM_GENERAL_PARAMS_PA,
@@ -341,6 +377,13 @@ impl IgvmBuilder {
                 parameter_area_index: IGVM_GENERAL_PARAMS_PA,
                 byte_offset: 4,
             }));
+        if self.gpa_map.madt.get_size() != 0 {
+            self.directives
+                .push(IgvmDirectiveHeader::Madt(IGVM_VHS_PARAMETER {
+                    parameter_area_index: IGVM_MADT_PA,
+                    byte_offset: 0,
+                }));
+        }
         self.directives
             .push(IgvmDirectiveHeader::MemoryMap(IGVM_VHS_PARAMETER {
                 parameter_area_index: IGVM_MEMORY_MAP_PA,
@@ -353,6 +396,15 @@ impl IgvmBuilder {
                 parameter_area_index: IGVM_MEMORY_MAP_PA,
             },
         ));
+        if self.gpa_map.madt.get_size() != 0 {
+            self.directives.push(IgvmDirectiveHeader::ParameterInsert(
+                IGVM_VHS_PARAMETER_INSERT {
+                    gpa: self.gpa_map.madt.get_start(),
+                    compatibility_mask: COMPATIBILITY_MASK.get(),
+                    parameter_area_index: IGVM_MADT_PA,
+                },
+            ));
+        }
         self.directives.push(IgvmDirectiveHeader::ParameterInsert(
             IGVM_VHS_PARAMETER_INSERT {
                 gpa: self.gpa_map.general_params.get_start(),
@@ -494,6 +546,21 @@ impl IgvmBuilder {
                 ANY_NATIVE_COMPATIBILITY_MASK,
                 &mut self.directives,
             );
+        }
+
+        if COMPATIBILITY_MASK.contains(ANY_NATIVE_COMPATIBILITY_MASK) {
+            // Include initial page tables.
+            construct_init_page_tables(
+                self.gpa_map.init_page_tables.get_start(),
+                ANY_NATIVE_COMPATIBILITY_MASK,
+                &mut self.directives,
+            );
+        }
+
+        // If the target includes a non-isolated platform, then insert the
+        // SIPI startup stub.
+        if COMPATIBILITY_MASK.contains(ANY_NATIVE_COMPATIBILITY_MASK) {
+            add_sipi_stub(ANY_NATIVE_COMPATIBILITY_MASK, &mut self.directives);
         }
 
         Ok(())

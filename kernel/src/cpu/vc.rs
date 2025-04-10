@@ -20,6 +20,9 @@ use crate::mm::GuestPtr;
 use crate::sev::ghcb::GHCB;
 use core::fmt;
 
+#[cfg(test)]
+use crate::testutils::{is_qemu_test_env, is_test_platform_type};
+
 pub const SVM_EXIT_EXCP_BASE: usize = 0x40;
 pub const SVM_EXIT_LAST_EXCP: usize = 0x5f;
 pub const SVM_EXIT_RDTSC: usize = 0x6e;
@@ -84,6 +87,13 @@ impl fmt::Display for VcError {
     }
 }
 
+/// Handles a #VC exception in stage 2 before the GHCB is set up.
+///
+/// # Parameters
+/// - registers state before the exception was raise through a [`X86ExceptionContext`].
+///
+/// # Returns
+/// - a `SvsmError` if the handling went wrong.
 pub fn stage2_handle_vc_exception_no_ghcb(ctx: &mut X86ExceptionContext) -> Result<(), SvsmError> {
     let err = ctx.error_code;
     let insn_ctx = vc_decode_insn(ctx)?;
@@ -97,6 +107,14 @@ pub fn stage2_handle_vc_exception_no_ghcb(ctx: &mut X86ExceptionContext) -> Resu
     Ok(())
 }
 
+/// Handles a #VC exception in stage 2 using GHCB features, requiring the GHCB to
+/// be set up beforehand.
+///
+/// # Parameters
+/// - registers state before the exception was raise through a [`X86ExceptionContext`].
+///
+/// # Returns
+/// - a `SvsmError` if the handling went wrong.
 pub fn stage2_handle_vc_exception(ctx: &mut X86ExceptionContext) -> Result<(), SvsmError> {
     let err = ctx.error_code;
 
@@ -111,7 +129,7 @@ pub fn stage2_handle_vc_exception(ctx: &mut X86ExceptionContext) -> Result<(), S
 
     match (err, insn_ctx.and_then(|d| d.insn())) {
         (SVM_EXIT_CPUID, Some(DecodedInsn::Cpuid)) => handle_cpuid(ctx),
-        (SVM_EXIT_IOIO, Some(ins)) => handle_ioio(ctx, ghcb, ins),
+        (SVM_EXIT_IOIO, Some(ins)) => early_handle_ioio(ctx, ghcb, ins),
         (SVM_EXIT_MSR, Some(ins)) => handle_msr(ctx, ghcb, ins),
         (SVM_EXIT_RDTSC, Some(DecodedInsn::Rdtsc)) => ghcb.rdtsc_regs(&mut ctx.regs),
         (SVM_EXIT_RDTSCP, Some(DecodedInsn::Rdtsc)) => ghcb.rdtscp_regs(&mut ctx.regs),
@@ -122,6 +140,14 @@ pub fn stage2_handle_vc_exception(ctx: &mut X86ExceptionContext) -> Result<(), S
     Ok(())
 }
 
+/// Handles a runtime #VC exception.
+///
+/// # Parameters
+/// - registers state before the exception was raise through a [`X86ExceptionContext`].
+/// - the exception vector code.
+///
+/// # Returns
+/// - a `SvsmError` if the handling went wrong.
 pub fn handle_vc_exception(ctx: &mut X86ExceptionContext, vector: usize) -> Result<(), SvsmError> {
     let error_code = ctx.error_code;
 
@@ -143,11 +169,7 @@ pub fn handle_vc_exception(ctx: &mut X86ExceptionContext, vector: usize) -> Resu
             Ok(())
         }
         (SVM_EXIT_CPUID, Some(DecodedInsn::Cpuid)) => handle_cpuid(ctx),
-        (SVM_EXIT_IOIO, Some(_)) => insn_ctx
-            .as_ref()
-            .unwrap()
-            .emulate(ctx)
-            .map_err(SvsmError::from),
+        (SVM_EXIT_IOIO, Some(_)) => handle_ioio(ctx, &insn_ctx.unwrap()),
         (SVM_EXIT_MSR, Some(ins)) => handle_msr(ctx, ghcb, ins),
         (SVM_EXIT_RDTSC, Some(DecodedInsn::Rdtsc)) => ghcb.rdtsc_regs(&mut ctx.regs),
         (SVM_EXIT_RDTSCP, Some(DecodedInsn::Rdtsc)) => ghcb.rdtscp_regs(&mut ctx.regs),
@@ -234,7 +256,12 @@ fn snp_cpuid(ctx: &mut X86ExceptionContext) -> Result<(), SvsmError> {
 }
 
 fn vc_finish_insn(ctx: &mut X86ExceptionContext, insn_ctx: &Option<DecodedInsnCtx>) {
-    ctx.frame.rip += insn_ctx.as_ref().map_or(0, |d| d.size())
+    let new_rip = ctx.frame.rip + insn_ctx.as_ref().map_or(0, |d| d.size());
+    // SAFETY: we are advancing the instruction pointer from the RIP generate by
+    // the exception plus the size of the decoded instruction.
+    unsafe {
+        ctx.set_rip(new_rip);
+    }
 }
 
 fn ioio_get_port(source: Operand, ctx: &X86ExceptionContext) -> u16 {
@@ -248,7 +275,7 @@ fn ioio_get_port(source: Operand, ctx: &X86ExceptionContext) -> u16 {
     }
 }
 
-fn handle_ioio(
+fn early_handle_ioio(
     ctx: &mut X86ExceptionContext,
     ghcb: &GHCB,
     insn: DecodedInsn,
@@ -266,6 +293,10 @@ fn handle_ioio(
         }
         _ => Err(VcError::new(ctx, VcErrorType::DecodeFailed).into()),
     }
+}
+
+fn handle_ioio(ctx: &mut X86ExceptionContext, insn_ctx: &DecodedInsnCtx) -> Result<(), SvsmError> {
+    insn_ctx.emulate_ioio(ctx).map_err(SvsmError::from)
 }
 
 fn vc_decode_insn(ctx: &X86ExceptionContext) -> Result<Option<DecodedInsnCtx>, SvsmError> {
@@ -300,6 +331,7 @@ mod tests {
     use crate::cpu::msr::{rdtsc, rdtscp, read_msr, write_msr, RdtscpOut};
     use crate::sev::ghcb::GHCB;
     use crate::sev::utils::{get_dr7, raw_vmmcall, set_dr7};
+    use bootlib::platform::SvsmPlatformType;
     use core::arch::asm;
     use core::arch::x86_64::__cpuid_count;
 
@@ -315,15 +347,17 @@ mod tests {
     #[test]
     #[cfg_attr(not(test_in_svsm), ignore = "Can only be run inside guest")]
     fn test_has_amd_cpuid() {
-        const CPUID_VENDOR_INFO: u32 = 0;
+        if is_test_platform_type(SvsmPlatformType::Snp) {
+            const CPUID_VENDOR_INFO: u32 = 0;
 
-        let vendor_info = unsafe { __cpuid_count(CPUID_VENDOR_INFO, 0) };
+            let vendor_info = unsafe { __cpuid_count(CPUID_VENDOR_INFO, 0) };
 
-        let vendor_name_bytes = [vendor_info.ebx, vendor_info.edx, vendor_info.ecx]
-            .map(|v| v.to_le_bytes())
-            .concat();
+            let vendor_name_bytes = [vendor_info.ebx, vendor_info.edx, vendor_info.ecx]
+                .map(|v| v.to_le_bytes())
+                .concat();
 
-        assert_eq!(core::str::from_utf8(&vendor_name_bytes), Ok("AuthenticAMD"));
+            assert_eq!(core::str::from_utf8(&vendor_name_bytes), Ok("AuthenticAMD"));
+        }
     }
 
     const GHCB_FILL_TEST_VALUE: u8 = b'1';
@@ -437,85 +471,101 @@ mod tests {
     #[test]
     #[cfg_attr(not(test_in_svsm), ignore = "Can only be run inside guest")]
     fn test_port_io_8() {
-        const TEST_VAL: u8 = 0x12;
-        verify_ghcb_gets_altered(|| outb(TESTDEV_ECHO_LAST_PORT, TEST_VAL));
-        assert_eq!(
-            TEST_VAL,
-            verify_ghcb_gets_altered(|| inb(TESTDEV_ECHO_LAST_PORT))
-        );
+        if is_qemu_test_env() && is_test_platform_type(SvsmPlatformType::Snp) {
+            const TEST_VAL: u8 = 0x12;
+            verify_ghcb_gets_altered(|| outb(TESTDEV_ECHO_LAST_PORT, TEST_VAL));
+            assert_eq!(
+                TEST_VAL,
+                verify_ghcb_gets_altered(|| inb(TESTDEV_ECHO_LAST_PORT))
+            );
+        }
     }
 
     #[test]
     #[cfg_attr(not(test_in_svsm), ignore = "Can only be run inside guest")]
     fn test_port_io_16() {
-        const TEST_VAL: u16 = 0x4321;
-        verify_ghcb_gets_altered(|| outw(TESTDEV_ECHO_LAST_PORT, TEST_VAL));
-        assert_eq!(
-            TEST_VAL,
-            verify_ghcb_gets_altered(|| inw(TESTDEV_ECHO_LAST_PORT))
-        );
+        if is_qemu_test_env() && is_test_platform_type(SvsmPlatformType::Snp) {
+            const TEST_VAL: u16 = 0x4321;
+            verify_ghcb_gets_altered(|| outw(TESTDEV_ECHO_LAST_PORT, TEST_VAL));
+            assert_eq!(
+                TEST_VAL,
+                verify_ghcb_gets_altered(|| inw(TESTDEV_ECHO_LAST_PORT))
+            );
+        }
     }
 
     #[test]
     #[cfg_attr(not(test_in_svsm), ignore = "Can only be run inside guest")]
     fn test_port_io_32() {
-        const TEST_VAL: u32 = 0xabcd1234;
-        verify_ghcb_gets_altered(|| outl(TESTDEV_ECHO_LAST_PORT, TEST_VAL));
-        assert_eq!(
-            TEST_VAL,
-            verify_ghcb_gets_altered(|| inl(TESTDEV_ECHO_LAST_PORT))
-        );
+        if is_qemu_test_env() && is_test_platform_type(SvsmPlatformType::Snp) {
+            const TEST_VAL: u32 = 0xabcd1234;
+            verify_ghcb_gets_altered(|| outl(TESTDEV_ECHO_LAST_PORT, TEST_VAL));
+            assert_eq!(
+                TEST_VAL,
+                verify_ghcb_gets_altered(|| inl(TESTDEV_ECHO_LAST_PORT))
+            );
+        }
     }
 
     #[test]
     #[cfg_attr(not(test_in_svsm), ignore = "Can only be run inside guest")]
     fn test_port_io_8_hardcoded() {
-        const TEST_VAL: u8 = 0x12;
-        verify_ghcb_gets_altered(|| outb_to_testdev_echo(TEST_VAL));
-        assert_eq!(TEST_VAL, verify_ghcb_gets_altered(inb_from_testdev_echo));
+        if is_qemu_test_env() && is_test_platform_type(SvsmPlatformType::Snp) {
+            const TEST_VAL: u8 = 0x12;
+            verify_ghcb_gets_altered(|| outb_to_testdev_echo(TEST_VAL));
+            assert_eq!(TEST_VAL, verify_ghcb_gets_altered(inb_from_testdev_echo));
+        }
     }
 
     #[test]
     #[cfg_attr(not(test_in_svsm), ignore = "Can only be run inside guest")]
     fn test_port_io_16_hardcoded() {
-        const TEST_VAL: u16 = 0x4321;
-        verify_ghcb_gets_altered(|| outw_to_testdev_echo(TEST_VAL));
-        assert_eq!(TEST_VAL, verify_ghcb_gets_altered(inw_from_testdev_echo));
+        if is_qemu_test_env() && is_test_platform_type(SvsmPlatformType::Snp) {
+            const TEST_VAL: u16 = 0x4321;
+            verify_ghcb_gets_altered(|| outw_to_testdev_echo(TEST_VAL));
+            assert_eq!(TEST_VAL, verify_ghcb_gets_altered(inw_from_testdev_echo));
+        }
     }
 
     #[test]
     #[cfg_attr(not(test_in_svsm), ignore = "Can only be run inside guest")]
     fn test_port_io_32_hardcoded() {
-        const TEST_VAL: u32 = 0xabcd1234;
-        verify_ghcb_gets_altered(|| outl_to_testdev_echo(TEST_VAL));
-        assert_eq!(TEST_VAL, verify_ghcb_gets_altered(inl_from_testdev_echo));
+        if is_qemu_test_env() && is_test_platform_type(SvsmPlatformType::Snp) {
+            const TEST_VAL: u32 = 0xabcd1234;
+            verify_ghcb_gets_altered(|| outl_to_testdev_echo(TEST_VAL));
+            assert_eq!(TEST_VAL, verify_ghcb_gets_altered(inl_from_testdev_echo));
+        }
     }
 
     #[test]
     #[cfg_attr(not(test_in_svsm), ignore = "Can only be run inside guest")]
     fn test_port_io_string_16_get_last() {
-        const TEST_DATA: &[u16] = &[0x1234, 0x5678, 0x9abc, 0xdef0];
-        verify_ghcb_gets_altered(|| rep_outsw(TESTDEV_ECHO_LAST_PORT, TEST_DATA));
-        assert_eq!(
-            TEST_DATA.last().unwrap(),
-            &verify_ghcb_gets_altered(|| inw(TESTDEV_ECHO_LAST_PORT))
-        );
+        if is_qemu_test_env() && is_test_platform_type(SvsmPlatformType::Snp) {
+            const TEST_DATA: &[u16] = &[0x1234, 0x5678, 0x9abc, 0xdef0];
+            verify_ghcb_gets_altered(|| rep_outsw(TESTDEV_ECHO_LAST_PORT, TEST_DATA));
+            assert_eq!(
+                TEST_DATA.last().unwrap(),
+                &verify_ghcb_gets_altered(|| inw(TESTDEV_ECHO_LAST_PORT))
+            );
 
-        let mut test_data: [u16; 4] = [0; 4];
-        verify_ghcb_gets_altered(|| rep_insw(TESTDEV_ECHO_LAST_PORT, &mut test_data));
-        for d in test_data.iter() {
-            assert_eq!(d, TEST_DATA.last().unwrap());
+            let mut test_data: [u16; 4] = [0; 4];
+            verify_ghcb_gets_altered(|| rep_insw(TESTDEV_ECHO_LAST_PORT, &mut test_data));
+            for d in test_data.iter() {
+                assert_eq!(d, TEST_DATA.last().unwrap());
+            }
         }
     }
 
     #[test]
     #[cfg_attr(not(test_in_svsm), ignore = "Can only be run inside guest")]
     fn test_sev_snp_enablement_msr() {
-        const MSR_SEV_STATUS: u32 = 0xc0010131;
-        const MSR_SEV_STATUS_SEV_SNP_ENABLED: u64 = 0b10;
+        if is_test_platform_type(SvsmPlatformType::Snp) {
+            const MSR_SEV_STATUS: u32 = 0xc0010131;
+            const MSR_SEV_STATUS_SEV_SNP_ENABLED: u64 = 0b10;
 
-        let sev_status = read_msr(MSR_SEV_STATUS);
-        assert_ne!(sev_status & MSR_SEV_STATUS_SEV_SNP_ENABLED, 0);
+            let sev_status = read_msr(MSR_SEV_STATUS);
+            assert_ne!(sev_status & MSR_SEV_STATUS_SEV_SNP_ENABLED, 0);
+        }
     }
 
     const MSR_APIC_BASE: u32 = 0x1b;
@@ -526,16 +576,21 @@ mod tests {
     #[test]
     #[cfg_attr(not(test_in_svsm), ignore = "Can only be run inside guest")]
     fn test_rdmsr_apic() {
-        let apic_base = verify_ghcb_gets_altered(|| read_msr(MSR_APIC_BASE));
-        assert_eq!(apic_base & APIC_BASE_PHYS_ADDR_MASK, APIC_DEFAULT_PHYS_BASE);
+        if is_qemu_test_env() && is_test_platform_type(SvsmPlatformType::Snp) {
+            let apic_base = verify_ghcb_gets_altered(|| read_msr(MSR_APIC_BASE));
+            assert_eq!(apic_base & APIC_BASE_PHYS_ADDR_MASK, APIC_DEFAULT_PHYS_BASE);
+        }
     }
 
     #[test]
-    #[cfg_attr(not(test_in_svsm), ignore = "Can only be run inside guest")]
+    //#[cfg_attr(not(test_in_svsm), ignore = "Can only be run inside guest")]
+    #[ignore = "DBG_CTL access no longer intercepted"]
     fn test_rdmsr_debug_ctl() {
-        const MSR_DEBUG_CTL: u32 = 0x1d9;
-        let apic_base = verify_ghcb_gets_altered(|| read_msr(MSR_DEBUG_CTL));
-        assert_eq!(apic_base, 0);
+        if is_qemu_test_env() && is_test_platform_type(SvsmPlatformType::Snp) {
+            const MSR_DEBUG_CTL: u32 = 0x1d9;
+            let apic_base = verify_ghcb_gets_altered(|| read_msr(MSR_DEBUG_CTL));
+            assert_eq!(apic_base, 0);
+        }
     }
 
     const MSR_TSC_AUX: u32 = 0xc0000103;
@@ -543,10 +598,14 @@ mod tests {
     #[test]
     #[cfg_attr(not(test_in_svsm), ignore = "Can only be run inside guest")]
     fn test_wrmsr_tsc_aux() {
-        let test_val = 0x1234;
-        verify_ghcb_gets_altered(|| write_msr(MSR_TSC_AUX, test_val));
-        let readback = verify_ghcb_gets_altered(|| read_msr(MSR_TSC_AUX));
-        assert_eq!(test_val, readback);
+        if is_qemu_test_env() && is_test_platform_type(SvsmPlatformType::Snp) {
+            let test_val = 0x1234;
+            verify_ghcb_gets_altered(||
+                // SAFETY: writing to TSC_AUX MSR doesn't break memory safety.
+                unsafe { write_msr(MSR_TSC_AUX, test_val) });
+            let readback = verify_ghcb_gets_altered(|| read_msr(MSR_TSC_AUX));
+            assert_eq!(test_val, readback);
+        }
     }
 
     #[test]
@@ -561,26 +620,31 @@ mod tests {
     // #[cfg_attr(not(test_in_svsm), ignore = "Can only be run inside guest")]
     #[ignore = "Currently unhandled by #VC handler"]
     fn test_vmmcall_vapic_poll_irq() {
-        const VMMCALL_HC_VAPIC_POLL_IRQ: u32 = 1;
+        if is_qemu_test_env() && is_test_platform_type(SvsmPlatformType::Snp) {
+            const VMMCALL_HC_VAPIC_POLL_IRQ: u32 = 1;
 
-        let res =
-            verify_ghcb_gets_altered(|| unsafe { raw_vmmcall(VMMCALL_HC_VAPIC_POLL_IRQ, 0, 0, 0) });
-        assert_eq!(res, 0);
+            let res = verify_ghcb_gets_altered(|| unsafe {
+                raw_vmmcall(VMMCALL_HC_VAPIC_POLL_IRQ, 0, 0, 0)
+            });
+            assert_eq!(res, 0);
+        }
     }
 
     #[test]
     // #[cfg_attr(not(test_in_svsm), ignore = "Can only be run inside guest")]
     #[ignore = "Currently unhandled by #VC handler"]
     fn test_read_write_dr7() {
-        const DR7_DEFAULT: u64 = 0x400;
-        const DR7_TEST: u64 = 0x401;
+        if is_qemu_test_env() && is_test_platform_type(SvsmPlatformType::Snp) {
+            const DR7_DEFAULT: u64 = 0x400;
+            const DR7_TEST: u64 = 0x401;
 
-        let old_dr7 = verify_ghcb_gets_altered(get_dr7);
-        assert_eq!(old_dr7, DR7_DEFAULT);
+            let old_dr7 = verify_ghcb_gets_altered(get_dr7);
+            assert_eq!(old_dr7, DR7_DEFAULT);
 
-        verify_ghcb_gets_altered(|| unsafe { set_dr7(DR7_TEST) });
-        let new_dr7 = verify_ghcb_gets_altered(get_dr7);
-        assert_eq!(new_dr7, DR7_TEST);
+            verify_ghcb_gets_altered(|| set_dr7(DR7_TEST));
+            let new_dr7 = verify_ghcb_gets_altered(get_dr7);
+            assert_eq!(new_dr7, DR7_TEST);
+        }
     }
 
     #[test]
@@ -597,21 +661,23 @@ mod tests {
     #[test]
     #[cfg_attr(not(test_in_svsm), ignore = "Can only be run inside guest")]
     fn test_rdtscp() {
-        let expected_pid = u32::try_from(verify_ghcb_gets_altered(|| read_msr(MSR_TSC_AUX)))
-            .expect("pid should be 32 bits");
-        let RdtscpOut {
-            timestamp: mut prev,
-            pid,
-        } = rdtscp();
-        assert_eq!(pid, expected_pid);
-        for _ in 0..50 {
+        if is_test_platform_type(SvsmPlatformType::Snp) {
+            let expected_pid = u32::try_from(verify_ghcb_gets_altered(|| read_msr(MSR_TSC_AUX)))
+                .expect("pid should be 32 bits");
             let RdtscpOut {
-                timestamp: cur,
+                timestamp: mut prev,
                 pid,
             } = rdtscp();
             assert_eq!(pid, expected_pid);
-            assert!(cur > prev);
-            prev = cur;
+            for _ in 0..50 {
+                let RdtscpOut {
+                    timestamp: cur,
+                    pid,
+                } = rdtscp();
+                assert_eq!(pid, expected_pid);
+                assert!(cur > prev);
+                prev = cur;
+            }
         }
     }
 

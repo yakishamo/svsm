@@ -9,8 +9,9 @@ extern crate alloc;
 use crate::address::{Address, VirtAddr};
 use crate::cpu::control_regs::{read_cr0, read_cr4};
 use crate::cpu::efer::read_efer;
-use crate::cpu::gdt::gdt;
+use crate::cpu::gdt::GLOBAL_GDT;
 use crate::cpu::registers::{X86GeneralRegs, X86InterruptFrame};
+use crate::cpu::shadow_stack::is_cet_ss_supported;
 use crate::insn_decode::{InsnError, InsnMachineCtx, InsnMachineMem, Register, SegRegister};
 use crate::locking::{RWLock, ReadLockGuard, WriteLockGuard};
 use crate::mm::GuestPtr;
@@ -19,6 +20,7 @@ use crate::types::{Bytes, SVSM_CS};
 use alloc::boxed::Box;
 use core::arch::{asm, global_asm};
 use core::mem;
+use core::ops::Deref;
 
 pub const DE_VECTOR: usize = 0;
 pub const DB_VECTOR: usize = 1;
@@ -39,12 +41,14 @@ pub const MF_VECTOR: usize = 16;
 pub const AC_VECTOR: usize = 17;
 pub const MCE_VECTOR: usize = 18;
 pub const XF_VECTOR: usize = 19;
+pub const VE_VECTOR: usize = 20;
 pub const CP_VECTOR: usize = 21;
 pub const HV_VECTOR: usize = 28;
 pub const VC_VECTOR: usize = 29;
 pub const SX_VECTOR: usize = 30;
 
 pub const INT_INJ_VECTOR: usize = 0x50;
+pub const IPI_VECTOR: usize = 0xE0;
 
 bitflags::bitflags! {
     /// Page fault error code flags.
@@ -61,9 +65,37 @@ bitflags::bitflags! {
 #[repr(C, packed)]
 #[derive(Default, Debug, Clone, Copy)]
 pub struct X86ExceptionContext {
+    pub ssp: u64,
+    _padding: [u8; 8],
     pub regs: X86GeneralRegs,
     pub error_code: usize,
     pub frame: X86InterruptFrame,
+}
+
+impl X86ExceptionContext {
+    /// # Safety
+    ///
+    /// The caller must ensure to update the rest of the execution state as
+    /// actual hardware would have done it (e.g. for MMIO emulation, CPUID,
+    /// MSR, etc.).
+    pub unsafe fn set_rip(&mut self, new_rip: usize) {
+        self.frame.rip = new_rip;
+
+        if is_cet_ss_supported() {
+            let return_on_stack = (self.ssp + 8) as *const usize;
+            let return_on_stack_val = new_rip;
+            // SAFETY: Inline assembly to update the instruction pointer on
+            // the shadow stack. The safety of the RIP value is delegated to
+            // the caller of this function which is unsafe.
+            unsafe {
+                asm!(
+                    "wrssq [{}], {}",
+                    in(reg) return_on_stack,
+                    in(reg) return_on_stack_val
+                );
+            }
+        }
+    }
 }
 
 impl InsnMachineCtx for X86ExceptionContext {
@@ -73,8 +105,8 @@ impl InsnMachineCtx for X86ExceptionContext {
 
     fn read_seg(&self, seg: SegRegister) -> u64 {
         match seg {
-            SegRegister::CS => gdt().kernel_cs().to_raw(),
-            _ => gdt().kernel_ds().to_raw(),
+            SegRegister::CS => GLOBAL_GDT.kernel_cs().to_raw(),
+            _ => GLOBAL_GDT.kernel_ds().to_raw(),
         }
     }
 
@@ -183,8 +215,10 @@ pub fn user_mode(ctxt: &X86ExceptionContext) -> bool {
     (ctxt.frame.cs & 3) == 3
 }
 
+// The base addresses of the IDT should be aligned on an 8-byte boundary
+// to maximize performance of cache line fills.
 #[derive(Copy, Clone, Default, Debug)]
-#[repr(C, packed)]
+#[repr(C, packed(8))]
 pub struct IdtEntry {
     low: u64,
     high: u64,
@@ -274,7 +308,7 @@ impl IdtEntry {
 
 const IDT_ENTRIES: usize = 256;
 
-#[repr(C, packed)]
+#[repr(C, packed(2))]
 #[derive(Default, Clone, Copy, Debug)]
 struct IdtDesc {
     size: u16,
@@ -309,6 +343,23 @@ impl IDT {
 
         self
     }
+
+    /// Load an IDT.
+    /// # Safety
+    /// The caller must guarantee that the IDT lifetime must be static so that
+    /// its entries are always available to the CPU.
+    pub unsafe fn load(&self) {
+        let desc: IdtDesc = IdtDesc {
+            size: (IDT_ENTRIES * 16) as u16,
+            address: VirtAddr::from(self.entries.as_ptr()),
+        };
+
+        // SAFETY: Inline assembly to load an IDT. `'static` lifetime ensures
+        // that address is always available for the CPU.
+        unsafe {
+            asm!("lidt (%rax)", in("rax") &desc, options(att_syntax));
+        }
+    }
 }
 
 impl Default for IDT {
@@ -318,24 +369,27 @@ impl Default for IDT {
 }
 
 impl WriteLockGuard<'static, IDT> {
-    /// Load an IDT. Its lifetime must be static so that its entries are
-    /// always available to the CPU.
     pub fn load(&self) {
-        let desc: IdtDesc = IdtDesc {
-            size: (IDT_ENTRIES * 16) as u16,
-            address: VirtAddr::from(self.entries.as_ptr()),
-        };
-
+        // SAFETY: the lifetime of the lock guard is static, so the safety
+        // requirement of IDT::load are met.
         unsafe {
-            asm!("lidt (%rax)", in("rax") &desc, options(att_syntax));
+            self.deref().load();
         }
     }
 }
 
 impl ReadLockGuard<'static, IDT> {
-    pub fn base_limit(&self) -> (u64, u32) {
+    pub fn load(&self) {
+        // SAFETY: the lifetime of the lock guard is static, so the safety
+        // requirement of IDT::load are met.
+        unsafe {
+            self.deref().load();
+        }
+    }
+
+    pub fn base_limit(&self) -> (u64, u16) {
         let base: *const IDT = core::ptr::from_ref(self);
-        let limit = (IDT_ENTRIES * mem::size_of::<IdtEntry>()) as u32;
+        let limit = (IDT_ENTRIES * mem::size_of::<IdtEntry>()) as u16;
         (base as u64, limit)
     }
 }
@@ -356,6 +410,8 @@ pub fn triple_fault() {
         address: VirtAddr::from(0u64),
     };
 
+    // SAFETY: This ends execution, this function will not return so memory
+    // safety is not an issue.
     unsafe {
         asm!("lidt (%rax)
               int3", in("rax") &desc, options(att_syntax));

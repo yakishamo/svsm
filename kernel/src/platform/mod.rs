@@ -4,30 +4,40 @@
 //
 // Author: Jon Lange <jlange@microsoft.com>
 
-use core::ops::{Deref, DerefMut};
-
-use crate::address::{PhysAddr, VirtAddr};
-use crate::cpu::cpuid::CpuidResult;
-use crate::cpu::percpu::PerCpu;
-use crate::error::SvsmError;
-use crate::io::IOPort;
-use crate::platform::native::NativePlatform;
-use crate::platform::snp::SnpPlatform;
-use crate::platform::tdp::TdpPlatform;
-use crate::types::PageSize;
-use crate::utils;
-use crate::utils::immut_after_init::ImmutAfterInitCell;
-use crate::utils::MemoryRegion;
-
-use bootlib::platform::SvsmPlatformType;
-
+pub mod capabilities;
 pub mod guest_cpu;
 pub mod native;
 pub mod snp;
 pub mod tdp;
 
+mod snp_fw;
+pub use snp_fw::{parse_fw_meta_data, SevFWMetaData};
+
+use capabilities::Caps;
+use native::NativePlatform;
+use snp::SnpPlatform;
+use tdp::TdpPlatform;
+
+use core::arch::asm;
+use core::ops::{Deref, DerefMut};
+
+use crate::address::{PhysAddr, VirtAddr};
+use crate::config::SvsmConfig;
+use crate::cpu::cpuid::CpuidResult;
+use crate::cpu::percpu::PerCpu;
+use crate::cpu::shadow_stack::determine_cet_support_from_cpuid;
+use crate::cpu::tlb::{flush_tlb, TlbFlushScope};
+use crate::error::SvsmError;
+use crate::io::IOPort;
+use crate::types::PageSize;
+use crate::utils::immut_after_init::ImmutAfterInitCell;
+use crate::utils::MemoryRegion;
+
+use bootlib::platform::SvsmPlatformType;
+
 static SVSM_PLATFORM_TYPE: ImmutAfterInitCell<SvsmPlatformType> = ImmutAfterInitCell::uninit();
 pub static SVSM_PLATFORM: ImmutAfterInitCell<SvsmPlatformCell> = ImmutAfterInitCell::uninit();
+pub static CAPS: ImmutAfterInitCell<Caps> = ImmutAfterInitCell::uninit();
 
 #[derive(Clone, Copy, Debug)]
 pub struct PageEncryptionMasks {
@@ -54,12 +64,18 @@ pub enum PageValidateOp {
 /// This defines a platform abstraction to permit the SVSM to run on different
 /// underlying architectures.
 pub trait SvsmPlatform {
+    #[cfg(test)]
+    fn platform_type(&self) -> SvsmPlatformType;
+
     /// Halts the system as required by the platform.
     fn halt()
     where
         Self: Sized,
     {
-        utils::halt();
+        // SAFETY: executing HLT in assembly is always safe.
+        unsafe {
+            asm!("hlt");
+        }
     }
 
     /// Performs basic early initialization of the runtime environment.
@@ -73,6 +89,20 @@ pub trait SvsmPlatform {
     /// (for services not used by stage2).
     fn env_setup_svsm(&self) -> Result<(), SvsmError>;
 
+    /// Performs the necessary preparations for launching guest boot firmware.
+    fn prepare_fw(
+        &self,
+        _config: &SvsmConfig<'_>,
+        _kernel_region: MemoryRegion<PhysAddr>,
+    ) -> Result<(), SvsmError> {
+        Ok(())
+    }
+
+    /// Launches guest boot firmware.
+    fn launch_fw(&self, _config: &SvsmConfig<'_>) -> Result<(), SvsmError> {
+        Ok(())
+    }
+
     /// Completes initialization of a per-CPU object during construction.
     fn setup_percpu(&self, cpu: &PerCpu) -> Result<(), SvsmError>;
 
@@ -81,6 +111,14 @@ pub trait SvsmPlatform {
 
     /// Determines the paging encryption masks for the current architecture.
     fn get_page_encryption_masks(&self) -> PageEncryptionMasks;
+
+    /// Determine whether shadow stacks are supported.
+    fn determine_cet_support(&self) -> bool {
+        determine_cet_support_from_cpuid()
+    }
+
+    /// Get the features and the capabilities of the platform.
+    fn capabilities(&self) -> Caps;
 
     /// Obtain CPUID using platform-specific tables.
     fn cpuid(&self, eax: u32) -> Option<CpuidResult>;
@@ -117,6 +155,11 @@ pub trait SvsmPlatform {
         op: PageValidateOp,
     ) -> Result<(), SvsmError>;
 
+    /// Performs a system-wide TLB flush.
+    fn flush_tlb(&self, flush_scope: &TlbFlushScope) {
+        flush_tlb(flush_scope);
+    }
+
     /// Configures the use of alternate injection as requested.
     fn configure_alternate_injection(&mut self, alt_inj_requested: bool) -> Result<(), SvsmError>;
 
@@ -142,6 +185,11 @@ pub trait SvsmPlatform {
 
     /// Start an additional processor.
     fn start_cpu(&self, cpu: &PerCpu, start_rip: u64) -> Result<(), SvsmError>;
+
+    /// Indicates whether this platform should invoke the SVSM request loop.
+    fn start_svsm_request_loop(&self) -> bool {
+        false
+    }
 }
 
 //FIXME - remove Copy trait
@@ -153,12 +201,26 @@ pub enum SvsmPlatformCell {
 }
 
 impl SvsmPlatformCell {
-    pub fn new(platform_type: SvsmPlatformType) -> Self {
+    pub fn new(platform_type: SvsmPlatformType, suppress_svsm_interrupts: bool) -> Self {
         assert_eq!(platform_type, *SVSM_PLATFORM_TYPE);
         match platform_type {
-            SvsmPlatformType::Native => SvsmPlatformCell::Native(NativePlatform::new()),
-            SvsmPlatformType::Snp => SvsmPlatformCell::Snp(SnpPlatform::new()),
-            SvsmPlatformType::Tdp => SvsmPlatformCell::Tdp(TdpPlatform::new()),
+            SvsmPlatformType::Native => {
+                SvsmPlatformCell::Native(NativePlatform::new(suppress_svsm_interrupts))
+            }
+            SvsmPlatformType::Snp => {
+                SvsmPlatformCell::Snp(SnpPlatform::new(suppress_svsm_interrupts))
+            }
+            SvsmPlatformType::Tdp => {
+                SvsmPlatformCell::Tdp(TdpPlatform::new(suppress_svsm_interrupts))
+            }
+        }
+    }
+
+    pub fn platform(&self) -> &dyn SvsmPlatform {
+        match self {
+            SvsmPlatformCell::Native(platform) => platform,
+            SvsmPlatformCell::Snp(platform) => platform,
+            SvsmPlatformCell::Tdp(platform) => platform,
         }
     }
 }
@@ -186,7 +248,12 @@ impl DerefMut for SvsmPlatformCell {
 }
 
 pub fn init_platform_type(platform_type: SvsmPlatformType) {
-    SVSM_PLATFORM_TYPE.init(&platform_type).unwrap();
+    SVSM_PLATFORM_TYPE.init(platform_type).unwrap();
+}
+
+pub fn init_capabilities() {
+    let caps = SVSM_PLATFORM.capabilities();
+    CAPS.init(caps).unwrap();
 }
 
 pub fn halt() {

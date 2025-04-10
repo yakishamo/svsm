@@ -6,25 +6,24 @@
 
 extern crate alloc;
 
-use crate::acpi::tables::ACPICPUInfo;
-use crate::address::{PhysAddr, VirtAddr};
+use crate::acpi::tables::{load_acpi_cpu_info, ACPICPUInfo, ACPITable};
+use crate::address::{Address, PhysAddr, VirtAddr};
 use crate::cpu::efer::EFERFlags;
 use crate::error::SvsmError;
-use crate::fw_meta::SevFWMetaData;
 use crate::mm::{GuestPtr, PerCPUPageMappingGuard, PAGE_SIZE};
-use crate::platform::{PageStateChangeOp, PageValidateOp, SVSM_PLATFORM};
+use crate::platform::{PageStateChangeOp, PageValidateOp, SevFWMetaData, SVSM_PLATFORM};
 use crate::types::PageSize;
 use crate::utils::MemoryRegion;
 use alloc::vec::Vec;
 use cpuarch::vmsa::VMSA;
 
 use bootlib::igvm_params::{IgvmGuestContext, IgvmParamBlock, IgvmParamPage};
+use bootlib::kernel_launch::LOWMEM_END;
 use core::mem::size_of;
+use core::slice;
 use igvm_defs::{IgvmEnvironmentInfo, MemoryMapEntryType, IGVM_VHS_MEMORY_MAP_ENTRY};
 
 const IGVM_MEMORY_ENTRIES_PER_PAGE: usize = PAGE_SIZE / size_of::<IGVM_VHS_MEMORY_MAP_ENTRY>();
-
-const STAGE2_END_ADDR: usize = 0xA0000;
 
 #[derive(Clone, Debug)]
 #[repr(C, align(64))]
@@ -37,6 +36,7 @@ pub struct IgvmParams<'a> {
     igvm_param_block: &'a IgvmParamBlock,
     igvm_param_page: &'a IgvmParamPage,
     igvm_memory_map: &'a IgvmMemoryMap,
+    igvm_madt: Option<&'a [u8]>,
     igvm_guest_context: Option<&'a IgvmGuestContext>,
 }
 
@@ -47,6 +47,19 @@ impl IgvmParams<'_> {
         let param_page = Self::try_aligned_ref::<IgvmParamPage>(param_page_address)?;
         let memory_map_address = addr + param_block.memory_map_offset as usize;
         let memory_map = Self::try_aligned_ref::<IgvmMemoryMap>(memory_map_address)?;
+        let madt_address = addr + param_block.madt_offset as usize;
+        let madt = if param_block.madt_size != 0 {
+            // SAFETY: the parameter block correctly describes the bounds of the
+            // MADT.
+            unsafe {
+                Some(slice::from_raw_parts(
+                    madt_address.as_ptr::<u8>(),
+                    param_block.madt_size as usize,
+                ))
+            }
+        } else {
+            None
+        };
         let guest_context = if param_block.guest_context_offset != 0 {
             let offset = usize::try_from(param_block.guest_context_offset).unwrap();
             Some(Self::try_aligned_ref::<IgvmGuestContext>(addr + offset)?)
@@ -58,6 +71,7 @@ impl IgvmParams<'_> {
             igvm_param_block: param_block,
             igvm_param_page: param_page,
             igvm_memory_map: memory_map,
+            igvm_madt: madt,
             igvm_guest_context: guest_context,
         })
     }
@@ -77,8 +91,34 @@ impl IgvmParams<'_> {
 
     pub fn find_kernel_region(&self) -> Result<MemoryRegion<PhysAddr>, SvsmError> {
         let kernel_base = PhysAddr::from(self.igvm_param_block.kernel_base);
-        let kernel_size: usize = self.igvm_param_block.kernel_size.try_into().unwrap();
-        Ok(MemoryRegion::<PhysAddr>::new(kernel_base, kernel_size))
+        let mut kernel_size = self.igvm_param_block.kernel_min_size;
+
+        // Check the untrusted hypervisor-provided memory map to see if the size of the kernel
+        // should be adjusted. The base location and mimimum and maximum size specified by the
+        // measured igvm_param_block are still respected to ensure a malicious memory map cannot
+        // cause the SVSM kernel to overlap anything important or be so small it causes weird
+        // failures. But if the hypervisor gives a memory map entry of type HIDDEN that starts at
+        // kernel_start, use the size of that entry as a guide. This allows the hypervisor to
+        // adjust the size of the SVSM kernel to what it expects will be needed based on the
+        // machine shape.
+        if let Some(memory_map_region) = self.igvm_memory_map.memory_map.iter().find(|region| {
+            region.entry_type == MemoryMapEntryType::HIDDEN
+                && region.starting_gpa_page_number.try_into() == Ok(kernel_base.pfn())
+        }) {
+            let region_size_bytes = memory_map_region
+                .number_of_pages
+                .try_into()
+                .unwrap_or(u32::MAX)
+                .saturating_mul(PAGE_SIZE as u32);
+            kernel_size = region_size_bytes.clamp(
+                self.igvm_param_block.kernel_min_size,
+                self.igvm_param_block.kernel_max_size,
+            );
+        }
+        Ok(MemoryRegion::<PhysAddr>::new(
+            kernel_base,
+            kernel_size.try_into().unwrap(),
+        ))
     }
 
     pub fn reserved_kernel_area_size(&self) -> usize {
@@ -223,17 +263,14 @@ impl IgvmParams<'_> {
         Ok(())
     }
 
-    pub fn load_cpu_info(&self) -> Result<Vec<ACPICPUInfo>, SvsmError> {
-        let mut cpus: Vec<ACPICPUInfo> = Vec::new();
-        log::info!("CPU count is {}", { self.igvm_param_page.cpu_count });
-        for i in 0..self.igvm_param_page.cpu_count {
-            let cpu = ACPICPUInfo {
-                apic_id: i,
-                enabled: true,
-            };
-            cpus.push(cpu);
+    pub fn load_cpu_info(&self) -> Result<Option<Vec<ACPICPUInfo>>, SvsmError> {
+        match self.igvm_madt {
+            Some(madt_data) => {
+                let madt = ACPITable::new(madt_data)?;
+                Ok(Some(load_acpi_cpu_info(&madt)?))
+            }
+            None => Ok(None),
         }
-        Ok(cpus)
     }
 
     pub fn should_launch_fw(&self) -> bool {
@@ -298,9 +335,12 @@ impl IgvmParams<'_> {
         let mut regions = Vec::new();
 
         if self.igvm_param_block.firmware.in_low_memory != 0 {
-            // Add the stage 2 region to the firmware region list so
+            // Add the lowmem region to the firmware region list so
             // permissions can be granted to the guest VMPL for that range.
-            regions.push(MemoryRegion::new(PhysAddr::new(0), STAGE2_END_ADDR));
+            regions.push(MemoryRegion::from_addresses(
+                PhysAddr::from(0u64),
+                PhysAddr::from(u64::from(LOWMEM_END)),
+            ));
         }
 
         regions.push(MemoryRegion::new(
@@ -388,5 +428,9 @@ impl IgvmParams<'_> {
 
     pub fn use_alternate_injection(&self) -> bool {
         self.igvm_param_block.use_alternate_injection != 0
+    }
+
+    pub fn is_qemu(&self) -> bool {
+        self.igvm_param_block.is_qemu != 0
     }
 }

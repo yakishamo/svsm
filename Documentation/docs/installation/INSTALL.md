@@ -193,8 +193,8 @@ Building the SVSM itself requires:
 - `x86_64-unknown-none` target toolchain installed (`rustup target add x86_64-unknown-none`)
 - `binutils` >= 2.39
 
-You may also need to install the Microsoft TPM build dependencies. On OpenSUSE
-you can do this by:
+You may also need to install the TPM 2.0 Reference Implementation build
+dependencies. On OpenSUSE you can do this by:
 
 ```
 $ sudo zypper in system-user-mail make gcc curl patterns-devel-base-devel_basis \
@@ -208,19 +208,18 @@ Then checkout the SVSM repository and build the SVSM binary:
 $ git clone https://github.com/coconut-svsm/svsm
 $ cd svsm
 $ git submodule update --init
-$ cargo install bindgen-cli
 ```
 
 That checks out the SVSM which can be built by
 
 ```
-$ FW_FILE=/path/to/firmware/OVMF.fd make
+$ FW_FILE=/path/to/firmware/OVMF.fd ./build configs/qemu-target.json
 ```
 
 to get a debug build of the SVSM or
 
 ```
-$ FW_FILE=/path/to/firmware/OVMF.fd make RELEASE=1
+$ FW_FILE=/path/to/firmware/OVMF.fd ./build --release configs/qemu-target.json
 ```
 
 to build the SVSM with the release target. When the build is finished
@@ -270,9 +269,10 @@ guest:
 
 ```
   -cpu EPYC-v4 \
-  -machine q35,confidential-guest-support=sev0,memory-backend=ram1 \
-  -object memory-backend-memfd,id=ram1,size=8G,share=true,prealloc=false,reserve=false\
-  -object sev-snp-guest,id=sev0,cbitpos=51,reduced-phys-bits=1,igvm-file=/path/to/coconut-qemu.igvm \
+  -machine q35,confidential-guest-support=sev0,memory-backend=ram1,igvm-cfg=igvm0 \
+  -object memory-backend-memfd,id=ram1,size=8G,share=true,prealloc=false,reserve=false \
+  -object sev-snp-guest,id=sev0,cbitpos=51,reduced-phys-bits=1 \
+  -object igvm-cfg,id=igvm0,file=/path/to/coconut-qemu.igvm
 ```
 
 This selects the ```EPYC-v4``` CPU type which will pass the CPUID validation
@@ -293,9 +293,10 @@ $ export IGVM=/path/to/coconut-qemu.igvm
 $ sudo $HOME/bin/qemu-svsm/bin/qemu-system-x86_64 \
   -enable-kvm \
   -cpu EPYC-v4 \
-  -machine q35,confidential-guest-support=sev0,memory-backend=ram1 \
+  -machine q35,confidential-guest-support=sev0,memory-backend=ram1,igvm-cfg=igvm0 \
   -object memory-backend-memfd,id=ram1,size=8G,share=true,prealloc=false,reserve=false \
-  -object sev-snp-guest,id=sev0,cbitpos=51,reduced-phys-bits=1,igvm-file=$IGVM \
+  -object sev-snp-guest,id=sev0,cbitpos=51,reduced-phys-bits=1 \
+  -object igvm-cfg,id=igvm0,file=$IGVM \
   -smp 8 \
   -no-reboot \
   -netdev user,id=vmnic -device e1000,netdev=vmnic,romfile= \

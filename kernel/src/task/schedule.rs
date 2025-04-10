@@ -32,13 +32,19 @@ extern crate alloc;
 
 use super::INITIAL_TASK_ID;
 use super::{Task, TaskListAdapter, TaskPointer, TaskRunListAdapter};
-use crate::address::Address;
+use crate::address::{Address, VirtAddr};
+use crate::cpu::irq_state::raw_get_tpr;
+use crate::cpu::msr::write_msr;
 use crate::cpu::percpu::{irq_nesting_count, this_cpu};
-use crate::cpu::sse::sse_restore_context;
-use crate::cpu::sse::sse_save_context;
+use crate::cpu::shadow_stack::{is_cet_ss_supported, IS_CET_SUPPORTED, PL0_SSP};
+use crate::cpu::sse::{sse_restore_context, sse_save_context};
 use crate::cpu::IrqGuard;
 use crate::error::SvsmError;
+use crate::fs::Directory;
 use crate::locking::SpinLock;
+use crate::mm::SVSM_CONTEXT_SWITCH_SHADOW_STACK;
+use crate::platform::SVSM_PLATFORM;
+use alloc::string::String;
 use alloc::sync::Arc;
 use core::arch::{asm, global_asm};
 use core::cell::OnceCell;
@@ -61,6 +67,9 @@ pub struct RunQueue {
 
     /// Temporary storage for tasks which are about to be terminated
     terminated_task: Option<TaskPointer>,
+
+    /// Pointer to a task that should be woken when returning from idle
+    wake_from_idle: Option<TaskPointer>,
 }
 
 impl RunQueue {
@@ -73,6 +82,7 @@ impl RunQueue {
             current_task: None,
             idle_task: OnceCell::new(),
             terminated_task: None,
+            wake_from_idle: None,
         }
     }
 
@@ -185,6 +195,16 @@ impl RunQueue {
     pub fn current_task(&self) -> TaskPointer {
         self.current_task.as_ref().unwrap().clone()
     }
+
+    /// Wakes a task from idle if required.
+    ///
+    /// # Returns
+    ///
+    /// An `Option<TaskPointer>` indicating which task should be woken, if
+    /// any.
+    pub fn wake_from_idle(&mut self) -> Option<TaskPointer> {
+        self.wake_from_idle.take()
+    }
 }
 
 /// Global task list
@@ -229,9 +249,19 @@ impl TaskList {
 
 pub static TASKLIST: SpinLock<TaskList> = SpinLock::new(TaskList::new());
 
-pub fn create_kernel_task(entry: extern "C" fn()) -> Result<TaskPointer, SvsmError> {
+/// Creates, initializes and starts a new kernel task. Note that the task has
+/// already started to run before this function returns.
+///
+/// # Arguments
+///
+/// * entry: The function to run as the new tasks main function
+///
+/// # Returns
+///
+/// A new instance of [`TaskPointer`] on success, [`SvsmError`] on failure.
+pub fn start_kernel_task(entry: extern "C" fn(), name: String) -> Result<TaskPointer, SvsmError> {
     let cpu = this_cpu();
-    let task = Task::create(cpu, entry)?;
+    let task = Task::create(cpu, entry, name)?;
     TASKLIST.lock().list().push_back(task.clone());
 
     // Put task on the runqueue of this CPU
@@ -242,15 +272,37 @@ pub fn create_kernel_task(entry: extern "C" fn()) -> Result<TaskPointer, SvsmErr
     Ok(task)
 }
 
-pub fn create_user_task(user_entry: usize) -> Result<TaskPointer, SvsmError> {
+/// Creates and initializes the kernel state of a new user task. The task is
+/// not added to the TASKLIST or run-queue yet.
+///
+/// # Arguments
+///
+/// * user_entry: The user-space entry point.
+///
+/// # Returns
+///
+/// A new instance of [`TaskPointer`] on success, [`SvsmError`] on failure.
+pub fn create_user_task(
+    user_entry: usize,
+    root: Arc<dyn Directory>,
+    name: String,
+) -> Result<TaskPointer, SvsmError> {
     let cpu = this_cpu();
-    let task = Task::create_user(cpu, user_entry)?;
+    Task::create_user(cpu, user_entry, root, name)
+}
+
+/// Finished user-space task creation by putting the task on the global
+/// TASKLIST and adding it to the run-queue.
+///
+/// # Arguments
+///
+/// * task: Pointer to user task
+pub fn finish_user_task(task: TaskPointer) {
+    // Add task to global TASKLIST
     TASKLIST.lock().list().push_back(task.clone());
 
     // Put task on the runqueue of this CPU
-    cpu.runqueue().lock_write().handle_task(task.clone());
-
-    Ok(task)
+    this_cpu().runqueue().lock_write().handle_task(task);
 }
 
 pub fn current_task() -> TaskPointer {
@@ -288,44 +340,88 @@ pub fn terminate() {
     schedule();
 }
 
+pub fn go_idle() {
+    // Mark this task as blocked and indicate that it is waiting for wake after
+    // idle.  Only one task on each CPU can be in the wake-from-idle state at
+    // one time.
+    let task = this_cpu().current_task();
+    task.set_task_blocked();
+    let mut runqueue = this_cpu().runqueue().lock_write();
+    assert!(runqueue.wake_from_idle.is_none());
+    runqueue.wake_from_idle = Some(task);
+    drop(runqueue);
+
+    // Find another task to run.  If no other task is runnable, then the idle
+    // thread will execute.
+    schedule();
+}
+
 // SAFETY: This function returns a raw pointer to a task. It is safe
 // because this function is only used in the task switch code, which also only
 // takes a single reference to the next and previous tasks. Also, this
 // function works on an Arc, which ensures that only a single mutable reference
 // can exist.
-unsafe fn task_pointer(taskptr: TaskPointer) -> *const Task {
+fn task_pointer(taskptr: TaskPointer) -> *const Task {
     Arc::as_ptr(&taskptr)
 }
 
+// SAFETY: The caller is required to provide correct pointers for the previous
+// and current tasks.
 #[inline(always)]
 unsafe fn switch_to(prev: *const Task, next: *const Task) {
-    let cr3: u64 = unsafe { (*next).page_table.lock().cr3_value().bits() as u64 };
+    // SAFETY: Assuming the caller has provided the correct task pointers,
+    // the page table and stack information in those tasks are correct and
+    // can be used to switch to the correct page table and execution stack.
+    unsafe {
+        let cr3 = (*next).page_table.lock().cr3_value().bits() as u64;
 
-    // Switch to new task
-    asm!(
-        r#"
-        call switch_context
-        "#,
-        in("rsi") prev as u64,
-        in("rdi") next as u64,
-        in("rdx") cr3,
-        options(att_syntax));
+        // The location of a cpu-local stack that's mapped into every set of
+        // page tables for use during context switches.
+        //
+        // If an IRQ is raised after switching the page tables but before
+        // switching to the new stack, the CPU will try to access the old stack
+        // in the new page tables. To protect against this, we switch to another
+        // stack that's mapped into both the old and the new set of page tables.
+        // That way we always have a valid stack to handle exceptions on.
+        let tos_cs: u64 = this_cpu().get_top_of_context_switch_stack().into();
+
+        // Switch to new task
+        asm!(
+            r#"
+            call switch_context
+            "#,
+            in("r12") prev as u64,
+            in("r13") next as u64,
+            in("r14") tos_cs,
+            in("r15") cr3,
+            options(att_syntax));
+    }
 }
 
 /// Initializes the [RunQueue] on the current CPU. It will switch to the idle
 /// task and initialize the current_task field of the RunQueue. After this
 /// function has ran it is safe to call [`schedule()`] on the current CPU.
-pub fn schedule_init() {
+///
+/// # Safety
+///
+/// This function can only be called when it is known that there is no current
+/// task.  Otherwise, the run state can become corrupted, and thus future
+/// calculation of task pointers can be incorrect.
+pub unsafe fn schedule_init() {
+    let guard = IrqGuard::new();
+    // SAFETY: The caller guarantees that there is no current task, and the
+    // pointer obtained for the next task will always be correct, thus
+    // providing a guarantee that the task switch will be safe.
     unsafe {
-        let guard = IrqGuard::new();
         let next = task_pointer(this_cpu().schedule_init());
         switch_to(null_mut(), next);
-        drop(guard);
     }
+    drop(guard);
 }
 
 fn preemption_checks() {
     assert!(irq_nesting_count() == 0);
+    assert!(raw_get_tpr() == 0 || !SVSM_PLATFORM.use_interrupts());
 }
 
 /// Perform a task switch and hand the CPU over to the next task on the
@@ -350,7 +446,17 @@ pub fn schedule() {
             this_cpu().populate_page_table(&mut pt);
         }
 
-        this_cpu().set_tss_rsp0(next.stack_bounds.end());
+        // SAFETY: ths stack pointer is known to be correct.
+        unsafe {
+            this_cpu().set_tss_rsp0(next.stack_bounds.end());
+        }
+        if is_cet_ss_supported() {
+            // SAFETY: Task::exception_shadow_stack is always initialized when
+            // creating a new Task.
+            unsafe {
+                write_msr(PL0_SSP, next.exception_shadow_stack.bits() as u64);
+            }
+        }
 
         // Get task-pointers, consuming the Arcs and release their reference
         unsafe {
@@ -404,41 +510,114 @@ global_asm!(
         pushq   %r15
         pushq   %rsp
 
-        // Save the current stack pointer
-        testq   %rsi, %rsi
+        // If `prev` is not null...
+        testq   %r12, %r12
+        // The initial stack is always mapped in the new page table.
         jz      1f
-        movq    %rsp, {TASK_RSP_OFFSET}(%rsi)
+
+        // Save the current stack pointer
+        movq    %rsp, {TASK_RSP_OFFSET}(%r12)
+
+        // Switch to a stack pointer that's valid in both the old and new page tables.
+        mov     %r14, %rsp
+
+        cmpb    $0, {IS_CET_SUPPORTED}(%rip)
+        je      1f
+        // Save the current shadow stack pointer
+        rdssp   %rax
+        sub     $8, %rax
+        movq    %rax, {TASK_SSP_OFFSET}(%r12)
+        // Switch to a shadow stack that's valid in both page tables and move
+        // the "shadow stack restore token" to the old shadow stack.
+        mov     ${CONTEXT_SWITCH_RESTORE_TOKEN}, %rax
+        rstorssp (%rax)
+        saveprevssp
 
     1:
         // Switch to the new task state
-        mov     %rdx, %cr3
+
+        // Switch to the new task page tables
+        mov     %r15, %cr3
+
+        cmpb    $0, {IS_CET_SUPPORTED}(%rip)
+        je      2f
+        // Switch to the new task shadow stack and move the "shadow stack
+        // restore token" back.
+        mov     {TASK_SSP_OFFSET}(%r13), %rdx
+        rstorssp (%rdx)
+        saveprevssp
+    2:
 
         // Switch to the new task stack
-        movq    {TASK_RSP_OFFSET}(%rdi), %rsp
+        movq    {TASK_RSP_OFFSET}(%r13), %rsp
 
         // We've already restored rsp
-        addq        $8, %rsp
+        addq    $8, %rsp
 
         // Restore the task context
-        popq        %r15
-        popq        %r14
-        popq        %r13
-        popq        %r12
-        popq        %r11
-        popq        %r10
-        popq        %r9
-        popq        %r8
-        popq        %rbp
-        popq        %rdi
-        popq        %rsi
-        popq        %rdx
-        popq        %rcx
-        popq        %rbx
-        popq        %rax
+        popq    %r15
+        popq    %r14
+        popq    %r13
+        popq    %r12
+        popq    %r11
+        popq    %r10
+        popq    %r9
+        popq    %r8
+        popq    %rbp
+        popq    %rdi
+        popq    %rsi
+        popq    %rdx
+        popq    %rcx
+        popq    %rbx
+        popq    %rax
         popfq
 
         ret
     "#,
     TASK_RSP_OFFSET = const offset_of!(Task, rsp),
+    TASK_SSP_OFFSET = const offset_of!(Task, ssp),
+    IS_CET_SUPPORTED = sym IS_CET_SUPPORTED,
+    CONTEXT_SWITCH_RESTORE_TOKEN = const CONTEXT_SWITCH_RESTORE_TOKEN.as_usize(),
     options(att_syntax)
 );
+
+/// The location of a cpu-local shadow stack restore token that's mapped into
+/// every set of page tables for use during context switches.
+///
+/// One interesting difference between the normal stack pointer and the shadow
+/// stack pointer is how they can be switched: For the normal stack pointer we
+/// can just move a new value into the RSP register. This doesn't work for the
+/// SSP register (the shadow stack pointer) because there's no way to directly
+/// move a value into it. Instead we have to use the `rstorssp` instruction.
+/// The key difference between this instruction and a regular `mov` is that
+/// `rstorssp` expects a "shadow stack restore token" to be at the top of the
+/// new shadow stack (this is just a special value that marks the top of a
+/// inactive shadow stack). After switching to a new shadow stack, the previous
+/// shadow stack is now inactive, and so the `saveprevssp` instruction can be
+/// used to transfer the shadow stack restore token from the new shadow stack
+/// to the previous one: `saveprevssp` atomically pops the stack token of the
+/// new shadow stack and pushes it on the previous shadow stack. This means
+/// that we have to execute both `rstorssp` and `saveprevssp` every time we
+/// want to switch the shadow stacks.
+///
+/// There's one major problem though: `saveprevssp` needs to access both the
+/// previous and the new shadow stack, but we only map each shadow stack into a
+/// single task's page tables. If each set of page tables only has access to
+/// either the previous or the new shadow stack, but not both, we can't execute
+/// `saveprevssp` and so we we can't move the shadow stack restore token to the
+/// previous shadow stack. If there's no shadow stack restore token on the
+/// previous shadow stack that means we can't restore this shadow stack at a
+/// later point. To work around this, we map another shadow stack into each
+/// CPU's set of pagetables. This allows us to do the following:
+///
+/// 1. Switch to the context-switch shadow stack using `rstorssp`.
+/// 2. Transfer the shadow stack restore token from the context switch shadow
+///    stack to the previous shadow stack by executing `saveprevssp`.
+/// 3. Switch the page tables. This doesn't lead to problems with the context
+///    switch shadow stack because it's mapped into both page tables.
+/// 4. Switch to the new shadow stack using `rstorssp`.
+/// 5. Transfer the shadow stack restore token from the new shadow stack back
+///    to the context switch shadow stacks by executing `saveprevssp`.
+///
+/// We just switched between two shadow stack tables in different page tables :)
+const CONTEXT_SWITCH_RESTORE_TOKEN: VirtAddr = SVSM_CONTEXT_SWITCH_SHADOW_STACK.const_add(0xff8);

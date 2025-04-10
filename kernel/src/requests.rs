@@ -12,13 +12,13 @@ use crate::protocols::apic::apic_protocol_request;
 use crate::protocols::core::core_protocol_request;
 use crate::protocols::errors::{SvsmReqError, SvsmResultCode};
 use crate::sev::ghcb::switch_to_vmpl;
+use crate::task::go_idle;
 
-#[cfg(all(feature = "mstpm", not(test)))]
+#[cfg(all(feature = "vtpm", not(test)))]
 use crate::protocols::{vtpm::vtpm_protocol_request, SVSM_VTPM_PROTOCOL};
 use crate::protocols::{RequestParams, SVSM_APIC_PROTOCOL, SVSM_CORE_PROTOCOL};
 use crate::sev::vmsa::VMSAControl;
 use crate::types::GUEST_VMPL;
-use crate::utils::halt;
 use cpuarch::vmsa::GuestVMExit;
 
 /// The SVSM Calling Area (CAA)
@@ -71,7 +71,12 @@ pub fn update_mappings() -> Result<(), SvsmError> {
     let mut ret = Ok(());
 
     if !locked.needs_update() {
-        return Ok(());
+        // If there is no VMSA, then the update request must be considered a
+        // failure even though no work was required.
+        return match locked.vmsa_phys() {
+            Some(_) => Ok(()),
+            None => Err(SvsmError::MissingVMSA),
+        };
     }
 
     cpu.unmap_guest_vmsa();
@@ -108,7 +113,7 @@ fn request_loop_once(
 
     match protocol {
         SVSM_CORE_PROTOCOL => core_protocol_request(request, params).map(|_| true),
-        #[cfg(all(feature = "mstpm", not(test)))]
+        #[cfg(all(feature = "vtpm", not(test)))]
         SVSM_VTPM_PROTOCOL => vtpm_protocol_request(request, params).map(|_| true),
         SVSM_APIC_PROTOCOL => apic_protocol_request(request, params).map(|_| true),
         _ => Err(SvsmReqError::unsupported_protocol()),
@@ -139,7 +144,11 @@ fn check_requests() -> Result<bool, SvsmReqError> {
     }
 }
 
-pub fn request_loop() {
+#[no_mangle]
+pub extern "C" fn request_loop_main() {
+    let apic_id = this_cpu().get_apic_id();
+    log::info!("Launching request loop task on CPU {}", apic_id);
+
     loop {
         // Determine whether the guest is runnable.  If not, halt and wait for
         // the guest to execute.  When halting, assume that the hypervisor
@@ -176,7 +185,7 @@ pub fn request_loop() {
             drop(guard);
         } else {
             log::debug!("No VMSA or CAA! Halting");
-            halt();
+            go_idle();
         }
 
         // Update mappings again on return from the guest VMPL or halt. If this

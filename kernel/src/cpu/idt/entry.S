@@ -2,7 +2,7 @@
 //
 // Copyright (c) 2024 SUSE LLC
 //
-// Authors: Joerg Roedel <jroedel@suse.de>
+// Author: Joerg Roedel <jroedel@suse.de>
 
 .code64
 
@@ -29,9 +29,15 @@ HV_DOORBELL_ADDR:
         pushq   %r13
         pushq   %r14
         pushq   %r15
+	pushq   $0
+	# rdsspq is a nop when shadow stacks are not supported. Make sure that
+	# rax is 0 if that's the case.
+	xorl	%eax, %eax
+	rdsspq  %rax
+	pushq	%rax
 .endm
 
-.macro default_entry_no_ist name: req handler:req error_code:req vector:req
+.macro default_entry_with_ist name: req handler:req error_code:req vector:req
 	.globl asm_entry_\name
 asm_entry_\name:
 	asm_clac
@@ -47,6 +53,26 @@ asm_entry_\name:
 	jmp	default_return
 .endm
 
+.macro default_entry_no_ist name: req handler:req error_code:req vector:req
+	.globl asm_entry_\name
+asm_entry_\name:
+	asm_clac
+
+	.if \error_code == 0
+	pushq $0
+	.endif
+	push_regs
+	testl 	${IF}, 0xA0(%rsp)
+	jz	L\@
+	sti
+L\@:
+	movl	$\vector, %esi
+	movq	%rsp, %rdi
+	xorl	%edx, %edx
+	call	ex_handler_\handler
+	jmp	default_return
+.endm
+
 .macro irq_entry name:req vector:req
 	.globl asm_entry_irq_\name
 asm_entry_irq_\name:
@@ -55,7 +81,7 @@ asm_entry_irq_\name:
 	pushq	$0
 	push_regs
 	movl	$\vector, %edi
-	call	common_isr_handler
+	call	common_isr_handler_entry
 	jmp	default_return
 .endm
 
@@ -107,6 +133,12 @@ asm_entry_hv:
 	// RIP is in the return window, so update RIP to the cancel point.
 	leaq	switch_vmpl_cancel(%rip), %rbx
 	movq	%rbx, 0x20(%rsp)
+	// Update RIP on the shadow stack to the cancel point.
+	cmpb    $0, {IS_CET_SUPPORTED}(%rip)
+        je 2f
+	rdsspq  %rax
+        wrssq	%rbx, 8(%rax)
+    2:
 	// Defer any further processing until interrupts can be processed.
 	jmp	postpone_hv
 hv_not_vmpl_switch:
@@ -141,12 +173,19 @@ hv_not_vmpl_switch:
 	// required.  This could not be performed before the RIP check because
 	// the previous RIP determines where to find the previous EFLAGS.IF
 	// value on the stack.
-	testl	${IF}, 18*8(%rcx)
+	testl	${IF}, 20*8(%rcx)
 	jz	postpone_hv
 	// Switch to the stack pointer from the previous exception, which
 	// points to the register save area, and continue with #HV
 	// processing.
 	movq	%rcx, %rsp
+	// Pop the current stack frame, so that the previous stack frame sits
+	// on top of the shadow stack.
+	cmpb	$0, {IS_CET_SUPPORTED}(%rip)
+        je	2f
+	movl	$3, %eax
+	incsspq	%rax
+    2:
 	jmp	handle_as_hv
 
 postpone_hv:
@@ -189,6 +228,13 @@ restart_hv:
 	movq	2*8(%rsp), %rax
 	movq	%rax, -2*8(%rcx)
 	leaq	-4*8(%rcx), %rsp
+	// Pop the current stack frame, so that the previous stack frame sits
+	// on top of the shadow stack.
+	cmpb	$0, {IS_CET_SUPPORTED}(%rip)
+        je	2f
+	movl	$3, %eax
+	incsspq	%rax
+    2:
 	
 continue_hv:
 	// At this point, only the dummy error code and first three registers
@@ -206,6 +252,12 @@ continue_hv:
         pushq   %r13
         pushq   %r14
         pushq   %r15
+	pushq   $0
+        # rdsspq is a nop when shadow stacks are not supported. Make sure that
+	# rdx is 0 if that's the case.
+	xorl	%edx, %edx
+	rdsspq  %rdx
+        pushq	%rdx
 handle_as_hv:
 	// Load the address of the #HV doorbell page.  The global address
 	// might not yet be configured, and the per-CPU page might also not
@@ -225,13 +277,13 @@ handle_as_hv_with_doorbell:
 default_return:
 	// Ensure that interrupts are disabled before attempting any return.
 	cli
-	testb	$3, 17*8(%rsp) // Check CS in exception frame
+	testb	$3, 19*8(%rsp) // Check CS in exception frame
 	jnz 	return_user
 return_all_paths:
 	// If interrupts were previously available, then check whether any #HV
 	// events are pending.  If so, proceed as if the original trap was
 	// #HV.
-	testl 	${IF}, 18*8(%rsp) // check EFLAGS.IF in exception frame
+	testl 	${IF}, 20*8(%rsp) // check EFLAGS.IF in exception frame
 	jz 	begin_iret_return
 	movq 	HV_DOORBELL_ADDR(%rip), %rdi
 	test 	%rdi, %rdi
@@ -251,23 +303,23 @@ iret_return_window:
 begin_iret_return:
 	// Reload registers without modifying the stack pointer so that if #HV
 	// occurs within this window, the saved registers are still intact.
-	movq 	0*8(%rsp), %r15
-	movq 	1*8(%rsp), %r14
-	movq 	2*8(%rsp), %r13
-	movq 	3*8(%rsp), %r12
-	movq 	4*8(%rsp), %r11
-	movq 	5*8(%rsp), %r10
-	movq 	6*8(%rsp), %r9
-	movq 	7*8(%rsp), %r8
-	movq 	8*8(%rsp), %rbp
-	movq 	9*8(%rsp), %rdi
-	movq 	10*8(%rsp), %rsi
-	movq 	11*8(%rsp), %rdx
-	movq 	12*8(%rsp), %rcx
-	movq 	13*8(%rsp), %rbx
-	movq 	14*8(%rsp), %rax
+	movq 	2*8(%rsp), %r15
+	movq 	3*8(%rsp), %r14
+	movq 	4*8(%rsp), %r13
+	movq 	5*8(%rsp), %r12
+	movq 	6*8(%rsp), %r11
+	movq 	7*8(%rsp), %r10
+	movq 	8*8(%rsp), %r9
+	movq 	9*8(%rsp), %r8
+	movq 	10*8(%rsp), %rbp
+	movq 	11*8(%rsp), %rdi
+	movq 	12*8(%rsp), %rsi
+	movq 	13*8(%rsp), %rdx
+	movq 	14*8(%rsp), %rcx
+	movq 	15*8(%rsp), %rbx
+	movq 	16*8(%rsp), %rax
 
-	addq 	$16*8, %rsp
+	addq 	$18*8, %rsp
 
 default_iret:
 	iretq
@@ -278,7 +330,7 @@ return_user:
 
 .globl return_new_task
 return_new_task:
-	call setup_new_task
+	call setup_user_task
 	jmp default_return
 
 // #DE Divide-by-Zero-Error Exception (Vector 0)
@@ -306,7 +358,7 @@ default_entry_no_ist	name=ud		handler=panic			error_code=0	vector=6
 default_entry_no_ist	name=nm		handler=panic			error_code=0	vector=7
 
 // #DF Double-Fault Exception (Vector 8)
-default_entry_no_ist	name=df		handler=double_fault		error_code=1	vector=8
+default_entry_with_ist	name=df		handler=double_fault		error_code=1	vector=8
 
 // Coprocessor-Segment-Overrun Exception (Vector 9)
 // No handler - reserved vector
@@ -340,10 +392,11 @@ default_entry_no_ist	name=mce	handler=panic			error_code=0	vector=18
 // #XF SIMD Floating-Point Exception (Vector 19)
 default_entry_no_ist	name=xf		handler=panic			error_code=0	vector=19
 
-// Vector 20 not defined
+// #VE Virtualization Exception (Vector 20)
+default_entry_no_ist	name=ve		handler=ve			error_code=0	vector=20
 
 // #CP Control-Protection Exception (Vector 21)
-default_entry_no_ist	name=cp		handler=panic			error_code=1	vector=21
+default_entry_no_ist	name=cp		handler=control_protection			error_code=1	vector=21
 
 // Vectors 22-27 not defined
 
@@ -358,5 +411,8 @@ default_entry_no_ist	name=int80	handler=system_call		error_code=0	vector=0x80
 
 // Interrupt injection vector
 irq_entry	name=int_inj	vector=0x50
+
+// IPI vector.
+irq_entry	name=ipi	vector=0xE0
 
 .popsection

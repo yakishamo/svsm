@@ -99,6 +99,13 @@ pub struct IgvmParamBlock {
     pub param_page_offset: u32,
 
     /// The offset, in bytes, from the base of the parameter block to the base
+    /// of the host-supplied MADT.
+    pub madt_offset: u32,
+
+    /// The size, in bytes, of the MADT area.
+    pub madt_size: u32,
+
+    /// The offset, in bytes, from the base of the parameter block to the base
     /// of the memory map (which is in IGVM format).
     pub memory_map_offset: u32,
 
@@ -112,8 +119,12 @@ pub struct IgvmParamBlock {
     /// Indicates whether the guest can support alternate injection.
     pub use_alternate_injection: u8,
 
+    /// Indicates whether the guest can assume firmware services specific to
+    /// QEMU.
+    pub is_qemu: u8,
+
     #[doc(hidden)]
-    pub _reserved: [u8; 5],
+    pub _reserved: [u8; 4],
 
     /// Metadata containing information about the firmware image embedded in the
     /// IGVM file.
@@ -132,11 +143,18 @@ pub struct IgvmParamBlock {
     /// memory region (e.g. for VMSA contents).
     pub kernel_reserved_size: u32,
 
-    /// The number of bytes in the kernel memory region.
-    pub kernel_size: u32,
-
     /// The guest physical address of the base of the kernel memory region.
     pub kernel_base: u64,
+
+    /// The minimum size to allocate for the kernel in bytes. If the hypervisor supplies a memory
+    /// region in the memory map that starts at kernel_base and is larger, that size will be used
+    /// instead.
+    pub kernel_min_size: u32,
+
+    /// The maximum size to allocate for the kernel in bytes. If the hypervisor supplies a memory
+    /// region in the memory map that starts at kernel_base and is larger, this maximum size will
+    /// be used instead.
+    pub kernel_max_size: u32,
 
     /// The value of vTOM used by the guest, or zero if not used.
     pub vtom: u64,

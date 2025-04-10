@@ -20,8 +20,8 @@ pub mod debug;
 pub mod error;
 pub mod fs;
 pub mod fw_cfg;
-pub mod fw_meta;
 pub mod greq;
+pub mod hyperv;
 pub mod igvm_params;
 pub mod insn_decode;
 pub mod io;
@@ -33,13 +33,13 @@ pub mod protocols;
 pub mod requests;
 pub mod serial;
 pub mod sev;
-pub mod string;
 pub mod svsm_paging;
 pub mod syscall;
 pub mod task;
+pub mod tdx;
 pub mod types;
 pub mod utils;
-#[cfg(all(feature = "mstpm", not(test)))]
+#[cfg(all(feature = "vtpm", not(test)))]
 pub mod vtpm;
 
 #[test]
@@ -56,3 +56,6 @@ extern crate self as svsm;
 // Include a module containing the test runner.
 #[cfg(all(test, test_in_svsm))]
 pub mod testing;
+// Utilities for test configurations.
+#[cfg(test)]
+pub mod testutils;

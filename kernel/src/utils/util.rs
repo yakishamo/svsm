@@ -6,9 +6,19 @@
 
 use crate::address::{Address, VirtAddr};
 use crate::types::PAGE_SIZE;
-use core::arch::asm;
 use core::ops::{Add, BitAnd, Not, Sub};
 
+use vstd::prelude::*;
+
+#[cfg(verus_keep_ghost)]
+include!("util.verus.rs");
+
+#[verus_spec(ret =>
+    requires
+        align_up_requires((addr, align)),
+    ensures
+        align_up_ens((addr, align), ret),
+)]
 pub fn align_up<T>(addr: T, align: T) -> T
 where
     T: Add<Output = T> + Sub<Output = T> + BitAnd<Output = T> + Not<Output = T> + From<u8> + Copy,
@@ -17,6 +27,12 @@ where
     (addr + mask) & !mask
 }
 
+#[verus_spec(ret =>
+    requires
+        align_down_requires((addr, align)),
+    ensures
+        align_down_ens((addr, align), ret),
+)]
 pub fn align_down<T>(addr: T, align: T) -> T
 where
     T: Sub<Output = T> + Not<Output = T> + BitAnd<Output = T> + From<u8> + Copy,
@@ -24,17 +40,17 @@ where
     addr & !(align - T::from(1u8))
 }
 
+#[verus_spec(ret =>
+    requires
+        is_aligned_requires((addr, align)),
+    ensures
+        is_aligned_ens((addr, align), ret)
+)]
 pub fn is_aligned<T>(addr: T, align: T) -> bool
 where
-    T: Sub<Output = T> + BitAnd<Output = T> + PartialEq + From<u32>,
+    T: Sub<Output = T> + BitAnd<Output = T> + PartialEq + From<u8>,
 {
-    (addr & (align - T::from(1))) == T::from(0)
-}
-
-pub fn halt() {
-    unsafe {
-        asm!("hlt", options(att_syntax));
-    }
+    (addr & (align - T::from(1u8))) == T::from(0u8)
 }
 
 pub fn page_align_up(x: usize) -> usize {
@@ -52,14 +68,22 @@ where
     x1 <= y2 && y1 <= x2
 }
 
-pub fn zero_mem_region(start: VirtAddr, end: VirtAddr) {
-    let size = end - start;
+/// # Safety
+///
+/// Caller should ensure [`core::ptr::write_bytes`] safety rules.
+pub unsafe fn zero_mem_region(start: VirtAddr, end: VirtAddr) {
     if start.is_null() {
         panic!("Attempted to zero out a NULL pointer");
     }
 
+    let count = end
+        .checked_sub(start.as_usize())
+        .expect("Invalid size calculation")
+        .as_usize();
+
     // Zero region
-    unsafe { start.as_mut_ptr::<u8>().write_bytes(0, size) }
+    // SAFETY: the safety rules must be upheld by the caller.
+    unsafe { start.as_mut_ptr::<u8>().write_bytes(0, count) }
 }
 
 /// Obtain bit for a given position
@@ -117,7 +141,11 @@ mod tests {
         let start = VirtAddr::from(data.as_mut_ptr());
         let end = start + core::mem::size_of_val(&data);
 
-        zero_mem_region(start, end);
+        // SAFETY: start and end correctly point respectively to the start and
+        // end of data.
+        unsafe {
+            zero_mem_region(start, end);
+        }
 
         for byte in &data {
             assert_eq!(*byte, 0);

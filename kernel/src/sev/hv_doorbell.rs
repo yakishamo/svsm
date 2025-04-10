@@ -2,13 +2,16 @@
 // Author: Jon Lange (jlange@microsoft.com)
 
 use crate::cpu::idt::svsm::common_isr_handler;
+use crate::cpu::irq_state::{raw_get_tpr, tpr_from_vector};
 use crate::cpu::percpu::this_cpu;
+use crate::cpu::IrqState;
 use crate::error::SvsmError;
 use crate::mm::page_visibility::SharedBox;
 use crate::mm::virt_to_phys;
 use crate::sev::ghcb::GHCB;
 
 use bitfield_struct::bitfield;
+use core::arch::asm;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 
@@ -57,11 +60,9 @@ pub fn allocate_hv_doorbell_page(ghcb: &GHCB) -> Result<&'static HVDoorbell, Svs
 
     // Create a static shared reference.
     let ptr = page.leak();
-    let doorbell = unsafe {
-        // SAFETY: Any bit-pattern is valid for `HVDoorbell` and it tolerates
-        // unsynchronized writes from the host.
-        ptr.as_ref()
-    };
+    // SAFETY: Any bit-pattern is valid for `HVDoorbell` and it tolerates
+    // unsynchronized writes from the host.
+    let doorbell = unsafe { ptr.as_ref() };
 
     Ok(doorbell)
 }
@@ -98,24 +99,64 @@ impl HVDoorbell {
             panic!("#MC exception delivered via #HV");
         }
 
-        // Consume interrupts as long as they are available.
+        // Consume interrupts as long as they are available and as long as
+        // they are appropriate for the current task priority.
+        let tpr = raw_get_tpr();
+        let mut vector = self.vector.load(Ordering::Relaxed);
         loop {
-            // Consume any interrupt that may be present.
-            let vector = self.vector.swap(0, Ordering::Relaxed);
-            if vector == 0 {
+            // Check whether an interrupt is present.  If it is at or below
+            // the current task priority, then it will not be dispatched.
+            // If the interrupt is not dispatched, then the vector must remain
+            // in the #HV doorbell page so the hypervisor knows it has not been
+            // placed into service.
+            if (tpr_from_vector(vector as usize)) <= tpr {
                 break;
             }
-            common_isr_handler(vector as usize);
+            match self
+                .vector
+                .compare_exchange_weak(vector, 0, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => common_isr_handler(vector as usize),
+                Err(new) => vector = new,
+            }
         }
 
         // Ignore per-VMPL events; these will be consumed when APIC emulation
         // is performed.
     }
 
-    pub fn process_if_required(&self) {
+    fn events_to_process(&self) -> bool {
+        // If NoFurtherSignal is set, it means the hypervisor has posted a
+        // new event, and there must be an event that requires processing.  If
+        // NoFurtherSignal is not set, then processing is required if the
+        // pending vector is a higher priority than the current TPR.
         let flags = HVDoorbellFlags::from(self.flags.load(Ordering::Relaxed));
         if flags.no_further_signal() {
+            true
+        } else {
+            let min_vector = (raw_get_tpr() + 1) << 4;
+            self.vector.load(Ordering::Relaxed) as usize >= min_vector
+        }
+    }
+
+    /// This function must always be called with interrupts enabled.
+    pub fn process_if_required(&self, irq_state: &IrqState) {
+        while self.events_to_process() {
+            // #HV event processing must always be performed with interrupts
+            // disabled.
+            irq_state.disable();
             self.process_pending_events();
+
+            // Do not call the standard enable routine, because that could
+            // recursively call to process new events, resulting in unbounded
+            // nesting.  Intead, decrement the nesting count and directly
+            // enable interrupts here before continuing the loop to see
+            // whether additional events have arrived.
+            assert_eq!(irq_state.pop_nesting(), 0);
+            // SAFETY: interrupts can now be enabled directly.
+            unsafe {
+                asm!("sti");
+            }
         }
     }
 
@@ -163,7 +204,17 @@ pub fn current_hv_doorbell() -> &'static HVDoorbell {
 /// Rust code.
 #[no_mangle]
 pub unsafe extern "C" fn process_hv_events(hv_doorbell: *const HVDoorbell) {
+    // Update the IRQ nesting state of the current CPU so calls to common
+    // code recognize that interrupts have been disabled.  Proceed as if
+    // interrupts were previously enabled, so that any code that deals with
+    // maskable interrupts knows that interrupts were enabled prior to reaching
+    // this point.
+    let cpu = this_cpu();
+    cpu.irqs_push_nesting(true);
+    // SAFETY: the correctness of #HV doorbell page has been guaranteed by the
+    // caller.
     unsafe {
         (*hv_doorbell).process_pending_events();
     }
+    cpu.irqs_pop_nesting();
 }

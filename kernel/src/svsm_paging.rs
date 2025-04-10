@@ -8,12 +8,13 @@ use crate::address::{Address, PhysAddr, VirtAddr};
 use crate::config::SvsmConfig;
 use crate::error::SvsmError;
 use crate::igvm_params::IgvmParams;
+use crate::mm::global_memory::init_global_ranges;
 use crate::mm::pagetable::{PTEntryFlags, PageTable};
 use crate::mm::PageBox;
 use crate::platform::{PageStateChangeOp, PageValidateOp, SvsmPlatform};
 use crate::types::PageSize;
-use crate::utils::MemoryRegion;
-use bootlib::kernel_launch::KernelLaunchInfo;
+use crate::utils::{page_align_up, MemoryRegion};
+use bootlib::kernel_launch::{KernelLaunchInfo, LOWMEM_END};
 
 struct IgvmParamInfo<'a> {
     virt_addr: VirtAddr,
@@ -89,7 +90,7 @@ pub fn init_page_table(
         )
         .expect("Failed to map heap");
 
-    pgtable.load();
+    init_global_ranges();
 
     Ok(pgtable)
 }
@@ -99,17 +100,19 @@ fn invalidate_boot_memory_region(
     config: &SvsmConfig<'_>,
     region: MemoryRegion<PhysAddr>,
 ) -> Result<(), SvsmError> {
-    log::info!(
-        "Invalidating boot region {:018x}-{:018x}",
-        region.start(),
-        region.end()
-    );
+    // Caller must ensure the memory region's starting address is page-aligned
+    let aligned_region = MemoryRegion::new(region.start(), page_align_up(region.len()));
+    log::info!("Invalidating boot region {aligned_region:#018x}");
 
-    if !region.is_empty() {
-        platform.validate_physical_page_range(region, PageValidateOp::Invalidate)?;
+    if !aligned_region.is_empty() {
+        platform.validate_physical_page_range(aligned_region, PageValidateOp::Invalidate)?;
 
         if config.page_state_change_required() {
-            platform.page_state_change(region, PageSize::Regular, PageStateChangeOp::Shared)?;
+            platform.page_state_change(
+                aligned_region,
+                PageSize::Regular,
+                PageStateChangeOp::Shared,
+            )?;
         }
     }
 
@@ -126,7 +129,10 @@ pub fn invalidate_early_boot_memory(
     // invalidate stage 2 memory, unless firmware is loaded into low memory.
     // Also invalidate the boot data if required.
     if !config.fw_in_low_memory() {
-        let lowmem_region = MemoryRegion::new(PhysAddr::null(), 640 * 1024);
+        let lowmem_region = MemoryRegion::from_addresses(
+            PhysAddr::from(0u64),
+            PhysAddr::from(u64::from(LOWMEM_END)),
+        );
         invalidate_boot_memory_region(platform, config, lowmem_region)?;
     }
 

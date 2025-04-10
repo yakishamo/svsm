@@ -8,12 +8,14 @@ extern crate alloc;
 
 use crate::cpu::percpu::current_task;
 use crate::error::SvsmError;
+use crate::fs::FsObj;
 use alloc::sync::Arc;
 
 #[derive(Clone, Copy, Debug)]
 pub enum ObjError {
     InvalidHandle,
     NotFound,
+    Busy,
 }
 
 /// An object represents the type of resource like file, VM, vCPU in the
@@ -22,7 +24,11 @@ pub enum ObjError {
 /// the common functionalities of the objects. With the trait bounds of Send
 /// and Sync, the objects implementing Obj trait could be sent to another
 /// thread and shared between threads safely.
-pub trait Obj: Send + Sync + core::fmt::Debug {}
+pub trait Obj: Send + Sync + core::fmt::Debug {
+    fn as_fs(&self) -> Option<&FsObj> {
+        None
+    }
+}
 
 /// ObjHandle is a unique identifier for an object in the current process.
 /// An ObjHandle can be converted to a u32 id which can be used by the user
@@ -67,7 +73,6 @@ impl From<ObjHandle> for u32 {
 ///
 /// This function will return an error if adding the object to the
 /// current task fails.
-#[expect(dead_code)]
 pub fn obj_add(obj: Arc<dyn Obj>) -> Result<ObjHandle, SvsmError> {
     current_task().add_obj(obj)
 }
@@ -87,7 +92,6 @@ pub fn obj_add(obj: Arc<dyn Obj>) -> Result<ObjHandle, SvsmError> {
 ///
 /// This function will return an error if removing the object from the
 /// current task fails.
-#[expect(dead_code)]
 pub fn obj_close(id: ObjHandle) -> Result<Arc<dyn Obj>, SvsmError> {
     current_task().remove_obj(id)
 }
@@ -107,7 +111,6 @@ pub fn obj_close(id: ObjHandle) -> Result<Arc<dyn Obj>, SvsmError> {
 ///
 /// This function will return an error if retrieving the object from the
 /// current task fails.
-#[expect(dead_code)]
 pub fn obj_get(id: ObjHandle) -> Result<Arc<dyn Obj>, SvsmError> {
     current_task().get_obj(id)
 }
