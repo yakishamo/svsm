@@ -15,19 +15,21 @@ use crate::console::init_svsm_console;
 use crate::cpu::cpuid::{cpuid_table, CpuidResult};
 use crate::cpu::percpu::{current_ghcb, this_cpu, PerCpu};
 use crate::cpu::tlb::TlbFlushScope;
+use crate::cpu::x86::{apic_enable, apic_initialize, apic_sw_enable};
 use crate::error::ApicError::Registration;
 use crate::error::SvsmError;
 use crate::greq::driver::guest_request_driver_init;
+use crate::hyperv;
 use crate::io::IOPort;
 use crate::mm::memory::write_guest_memory_map;
 use crate::mm::{PerCPUPageMappingGuard, PAGE_SIZE, PAGE_SIZE_2M};
 use crate::sev::ghcb::GHCBIOSize;
-use crate::sev::hv_doorbell::current_hv_doorbell;
 use crate::sev::msr_protocol::{
     hypervisor_ghcb_features, request_termination_msr, verify_ghcb_version, GHCBHvFeatures,
 };
 use crate::sev::status::vtom_enabled;
 use crate::sev::tlb::flush_tlb_scope;
+use crate::sev::GHCB_APIC_ACCESSOR;
 use crate::sev::{
     init_hypervisor_ghcb_features, pvalidate_range, sev_status_init, sev_status_verify, PvalidateOp,
 };
@@ -157,6 +159,10 @@ impl SvsmPlatform for SnpPlatform {
             cpu.configure_hv_doorbell()?;
         }
 
+        apic_initialize(&GHCB_APIC_ACCESSOR);
+        apic_enable();
+        apic_sw_enable();
+
         Ok(())
     }
 
@@ -204,8 +210,37 @@ impl SvsmPlatform for SnpPlatform {
         Caps::new(vm_bitmap, features)
     }
 
+    /// # Safety
+    /// Hypercalls may have side-effects that affect the integrity of the
+    /// system, and the caller must take responsibility for ensuring that the
+    /// hypercall operation is safe.
+    unsafe fn hypercall(
+        &self,
+        input_control: hyperv::HvHypercallInput,
+        hypercall_pages: &hyperv::HypercallPagesGuard<'_>,
+    ) -> hyperv::HvHypercallOutput {
+        hyperv::execute_host_hypercall(input_control, hypercall_pages, |registers| {
+            current_ghcb()
+                .vmmcall(registers)
+                .expect("VMMCALL exit failed");
+        })
+    }
+
     fn cpuid(&self, eax: u32) -> Option<CpuidResult> {
-        cpuid_table(eax)
+        // If this is an architectural CPUID leaf, then extract the result
+        // from the CPUID table.  Otherwise, request the value from the
+        // hypervisor.
+        if (eax >> 28) == 4 {
+            current_ghcb().cpuid(eax).ok()
+        } else {
+            cpuid_table(eax)
+        }
+    }
+
+    unsafe fn write_host_msr(&self, msr: u32, value: u64) {
+        current_ghcb()
+            .wrmsr(msr, value)
+            .expect("Host MSR access failed");
     }
 
     fn setup_guest_host_comm(&mut self, cpu: &PerCpu, is_bsp: bool) {
@@ -314,21 +349,6 @@ impl SvsmPlatform for SnpPlatform {
 
     fn use_interrupts(&self) -> bool {
         self.can_use_interrupts
-    }
-
-    fn post_irq(&self, icr: u64) -> Result<(), SvsmError> {
-        current_ghcb().hv_ipi(icr)?;
-        Ok(())
-    }
-
-    fn eoi(&self) {
-        // Issue an explicit EOI unless no explicit EOI is required.
-        if !current_hv_doorbell().no_eoi_required() {
-            // 0x80B is the X2APIC EOI MSR.
-            // Errors here cannot be handled but should not be grounds for
-            // panic.
-            let _ = current_ghcb().wrmsr(0x80B, 0);
-        }
     }
 
     fn is_external_interrupt(&self, _vector: usize) -> bool {
