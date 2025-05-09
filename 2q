@@ -4,6 +4,7 @@
 //
 // Author: Joerg Roedel <jroedel@suse.de>
 // use core::arch::asm;
+use core::arch::x86_64::_mm_clflush;
 use crate::address::{Address, PhysAddr, VirtAddr};
 use crate::cpu::flush_tlb_global_sync;
 use crate::cpu::percpu::{this_cpu, this_cpu_shared, PERCPU_AREAS, PERCPU_VMSAS};
@@ -25,11 +26,6 @@ use crate::sev::vmsa::VMSAControl;
 use crate::types::{PageSize, PAGE_SIZE, PAGE_SIZE_2M};
 use crate::utils::zero_mem_region;
 use cpuarch::vmsa::VMSA;
-
-use crate::mm::pagetable::PTEntryFlags;
-use crate::mm::virtualrange::VRangeAlloc;
-use crate::utils::MemoryRegion;
-use core::ptr::copy_nonoverlapping;
 
 const SVSM_REQ_CORE_REMAP_CA: u32 = 0;
 const SVSM_REQ_CORE_PVALIDATE: u32 = 1;
@@ -442,18 +438,8 @@ fn read_phys(phys_addr : u64) -> Result<u64, SvsmReqError> {
 	Ok( unsafe{ vaddr.read()? } )
 }
 
-unsafe fn copy_guest_4k(phys_addr : u64, dst : u64) -> Result<(), SvsmReqError> {
-	let dst = dst & 0xfffffffffffff000;
-	let dst = dst as *mut u8;
-	let phys_addr = PhysAddr::from(phys_addr).page_align();
-	let mapping_guard = PerCPUPageMappingGuard::create_4k(phys_addr)?;
-	let start = mapping_guard.virt_addr();
-	let src = start.as_ptr() as *const u8;
-	unsafe { copy_nonoverlapping(src, dst, 4096) };
-	Ok(())
-}
-
-fn transrate_guestmem(addr: u64) -> Result<u64, SvsmReqError> {
+fn read_guestmem(addr: u64) -> Result<u64, SvsmReqError> {
+	// log::info!("read_guestmem called");
 	let mut vmsa_ref = this_cpu().guest_vmsa_ref();
 	let vmsa = vmsa_ref.vmsa();
 	let cr3 = vmsa.cr3;	
@@ -461,40 +447,47 @@ fn transrate_guestmem(addr: u64) -> Result<u64, SvsmReqError> {
 	let l4page_ent_offset = ((addr >> 39) & 0b1_11111111)*8; //9bits mask
 	let l4page_ent = cr3 + l4page_ent_offset;
 	let mut l4page_ent = read_phys(l4page_ent)?;
+	// log::info!("  l4: 0x{:x}", l4page_ent);
 	l4page_ent &= 0x000f_ffff_ffff_f000;
 
 	let l3page_ent_offset = ((addr >> 30) & 0b1_11111111)*8;
 	let l3page_ent = l4page_ent + l3page_ent_offset;
 	let mut l3page_ent = read_phys(l3page_ent)?;
+	// log::info!("  l3: 0x{:x}", l3page_ent);
 	l3page_ent &= 0x000f_ffff_ffff_f000;
 
 	let l2page_ent_offset = ((addr >> 21) & 0b1_11111111)*8;
 	let l2page_ent = l3page_ent + l2page_ent_offset;
 	let mut l2page_ent = read_phys(l2page_ent)?;
+	// log::info!("  l2: 0x{:x}", l2page_ent);
 	if ((l2page_ent >> 7)&0x1) == 1 {
 		l2page_ent &= 0x000f_ffff_ffe0_0000;
 		let phys_offset = addr & 0x1fffff;
 		let phys_addr = l2page_ent | phys_offset;
-/*
+		// log::info!("phys_addr : 0x{:x}", phys_addr);
 		return match read_phys(phys_addr) {
 			Ok(num) => {
 				Ok(num)
 			},
 			Err(e) => Err(e),
 		}
-		*/
-		return Ok(phys_addr);
 	}
 	l2page_ent &= 0x000f_ffff_ffff_f000;
 
 	let l1page_ent_offset = ((addr >> 12) & 0b1_11111111)*8;
 	let l1page_ent = l2page_ent + l1page_ent_offset;
 	let mut l1page_ent = read_phys(l1page_ent)?;
+	// log::info!("  l1: 0x{:x}", l1page_ent);
 	l1page_ent &= 0x000f_ffff_ffff_f000;
 
 	let phys_offset = addr & 0x0fff;
 	let phys_addr = l1page_ent + phys_offset;
-	Ok(phys_addr)
+	match read_phys(phys_addr) {
+		Ok(num) => {
+			Ok(num)
+		},
+		Err(e) => Err(e),
+	}
 }
 
 // dump params
@@ -506,27 +499,10 @@ fn core_call_test(params: &mut RequestParams) -> Result<(), SvsmReqError> {
 	Ok(())
 }
 
-fn map_shmem(paddr: PhysAddr, size: usize) -> Result<VirtAddr, SvsmReqError> {
-	let flags = PTEntryFlags::data();
-	let range = VRangeAlloc::new_4k(size, 0)?;
-	this_cpu()
-		.get_pgtable()
-		.map_region_4k(range.region(), paddr, flags, true)?;
-	Ok(range.region().start())
-}
-
-fn unmap_shmem(vaddr: VirtAddr, size: usize) -> Result<(), SvsmReqError> {
-	let region = MemoryRegion::new(vaddr, size);
-	this_cpu()
-		.get_pgtable()
-		.unmap_region_4k(region);
-	Ok(())
-}
-
 // no input
 fn core_write_shmem(_params: &mut RequestParams) -> Result<(), SvsmReqError> {
 	// mapping shared memory
-//*
+	/*
 	unsafe {
 		if SHMEM_PHYS_ADDR == 0 {
 			log::info!("SHMEM_PHYS_ADDR not set");
@@ -553,69 +529,39 @@ fn core_write_shmem(_params: &mut RequestParams) -> Result<(), SvsmReqError> {
 	
 	let shmem : *mut SharedMemory = 
 		(start + offset).as_mut_ptr::<SharedMemory>() as *mut SharedMemory;
-//	*/
-
-/*
-	let shmem = unsafe{
-		match SHMEM {
-			None => {
-				log::info!("shared memory not registerd.");
-				return Ok(());
-			},
-			Some(s) => {
-				log::info!("shmem addr found.");
-				log::info!("shmem : 0x{:p}", s);
-				s
-			}
+	*/
+	let shmem = match unsafe{SHMEM_MAPPINGGUARD} {
+		Some(guard) => {
+			guard.virt_addr().ad_mut_ptr::<SharedMemory>() as *mut SharedMemory
+		},
+		None => {
+			log::info!("error: shared memory not registerd.");
+			return Err(SvsmReqError::invalid_parameter());
 		}
-	};
-	
-	*/
-	let target_guest_addr = unsafe{(*shmem).address} & 0xfffffffffffff000;
-	/*
-	for i in 0..512 {
-		let target_phys_addr = match transrate_guestmem(target_guest_addr + i*8) {
-			Ok(a) => {
-				a
-			},
-			Err(e) => {
-				log::info!("transrate_guestmem(guest_vaddr) error");
-				return Err(e);
-			}
-		};
-		unsafe{ (*shmem).value[i as usize] = read_phys(target_phys_addr)?;}
 	}
-	*/
-
-	let target_phys_addr = match transrate_guestmem(target_guest_addr) {
-		Ok(a) => a,
+	let target_guest_addr = unsafe{(*shmem).address};
+	let num = match read_guestmem(target_guest_addr) {
+		Ok(a) => {
+			a
+		},
 		Err(e) => {
-			log::info!("transrate_guestmem(guest_vaddr) error");
+			log::info!("read_guestmem(guest_vaddr) error");
 			return Err(e);
 		}
 	};
-	unsafe {
-		//copy_guest_4k(target_phys_addr, ((*shmem).value.as_mut_ptr()) as *mut [u64;512] as u64);
-		copy_guest_4k(target_phys_addr, shmem as u64 + 4096)?;
-	}
-
-	/*
-	log::info!("write value to shmem");
 	unsafe{(*shmem).value[0] = num;}
-	log::info!("write size to shmem");
 	unsafe{(*shmem).size = 4096;}
-	log::info!("wrote");
-	*/
 
-	// unsafe{ _mm_clflush(shmem_addr); }
+	let shmem_addr : u64 = (start + offset).into();
+	let shmem_addr : *const u8 = shmem_addr as *const u8;
+	unsafe{ _mm_clflush(shmem_addr); }
 	Ok(())
 }
 
-static mut SHMEM_SIZE : usize = 0;
-static mut SHMEM : Option<*mut SharedMemory> = None;
-static mut SHMEM_PHYS_ADDR : u64 = 0x0;
-const SHMEM_MAPPING_SIZE : usize = 0x2000;
-#[repr(packed)]
+static mut SHMEM_PHYS_ADDR : u64 = 0;
+static mut SHMEM_SIZE : u64 = 0;
+static mut SHMEM_MAPPINGGUARD : Option<PerCPUPageMappingGuard> = None;
+#[repr(C)]
 struct SharedMemory {
 	address : u64,
 	size : u64,
@@ -629,37 +575,12 @@ fn core_register_shmem(params: &mut RequestParams) -> Result<(), SvsmReqError> {
 	log::info!("register_shmem called");
 	log::info!("shmem : 0x{:x}", params.rcx);
 	log::info!("shmem_size : 0x{:x}", params.rdx);
-
-	if params.rdx < SHMEM_MAPPING_SIZE as u64 {
-		log::info!("shmem_size is not enough");
-		return Ok(());
-	}
-
-/*
-	let shmem = match unsafe { SHMEM } {
-		None => {
-			map_shmem(PhysAddr::new(params.rcx as usize), SHMEM_MAPPING_SIZE)?
-		},
-		Some(s) => {
-			unmap_shmem(s.into(), SHMEM_MAPPING_SIZE)?;
-			map_shmem(PhysAddr::new(params.rcx as usize), SHMEM_MAPPING_SIZE)?
-		}
-	};
-
+	let phys_addr = PhysAddr::from(params.rcx);
+	let paddr = phys_addr.page_align();
 	unsafe {
-		SHMEM_SIZE = params.rdx as usize;
-		SHMEM = Some(shmem.as_mut_ptr::<SharedMemory>() as *mut SharedMemory);
-		log::info!("SHMEM : 0x{:x}", shmem);
-		match SHMEM {
-			Some(i) => {
-				log::info!("shmem.address : 0x{:x}", (*i).address);
-			},
-			None => {},
-		}
-	}
-// */
-	unsafe {
+		SHMEM_MAPPINGGUARD = Some(PerCPUPageMappingGuard::create(paddr, paddr + PAGE_SIZE*2, 0)?);
 		SHMEM_PHYS_ADDR = params.rcx;
+		SHMEM_SIZE = params.rdx;
 	}
 	Ok(())
 }

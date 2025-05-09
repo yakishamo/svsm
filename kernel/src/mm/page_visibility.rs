@@ -36,6 +36,7 @@ use zerocopy::{FromBytes, FromZeros};
 /// Notably any objects at `vaddr` must tolerate unsynchronized writes of any
 /// bit pattern.  In addition, the caller must take responsibility for
 /// returning a page to the private state if it is ever freed.
+
 pub unsafe fn make_page_shared(vaddr: VirtAddr) -> Result<(), SvsmError> {
     // Revoke page validation before changing page state.
 		// let unchange = SvsmError::from(SevSnpError::FAIL_UNCHANGED(0x10));
