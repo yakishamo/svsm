@@ -26,9 +26,6 @@ use crate::types::{PageSize, PAGE_SIZE, PAGE_SIZE_2M};
 use crate::utils::zero_mem_region;
 use cpuarch::vmsa::VMSA;
 
-use crate::mm::pagetable::PTEntryFlags;
-use crate::mm::virtualrange::VRangeAlloc;
-use crate::utils::MemoryRegion;
 use core::ptr::copy_nonoverlapping;
 
 const SVSM_REQ_CORE_REMAP_CA: u32 = 0;
@@ -43,6 +40,8 @@ const SVSM_REQ_CORE_REGISTER_SHMEM : u32 = 8;
 const SVSM_REQ_CORE_CALL_TEST : u32 = 9;
 const SVSM_REQ_CORE_WRITE_SHMEM : u32 = 10;
 const SVSM_REQ_CORE_NOTHING : u32 = 11;
+const SVSM_REQ_CORE_POLLING_AGENT : u32 = 12;
+
 
 const CORE_PROTOCOL_VERSION_MIN: u32 = 1;
 const CORE_PROTOCOL_VERSION_MAX: u32 = 1;
@@ -506,23 +505,6 @@ fn core_call_test(params: &mut RequestParams) -> Result<(), SvsmReqError> {
 	Ok(())
 }
 
-fn map_shmem(paddr: PhysAddr, size: usize) -> Result<VirtAddr, SvsmReqError> {
-	let flags = PTEntryFlags::data();
-	let range = VRangeAlloc::new_4k(size, 0)?;
-	this_cpu()
-		.get_pgtable()
-		.map_region_4k(range.region(), paddr, flags, true)?;
-	Ok(range.region().start())
-}
-
-fn unmap_shmem(vaddr: VirtAddr, size: usize) -> Result<(), SvsmReqError> {
-	let region = MemoryRegion::new(vaddr, size);
-	this_cpu()
-		.get_pgtable()
-		.unmap_region_4k(region);
-	Ok(())
-}
-
 // no input
 fn core_write_shmem(_params: &mut RequestParams) -> Result<(), SvsmReqError> {
 	// mapping shared memory
@@ -611,8 +593,6 @@ fn core_write_shmem(_params: &mut RequestParams) -> Result<(), SvsmReqError> {
 	Ok(())
 }
 
-static mut SHMEM_SIZE : usize = 0;
-static mut SHMEM : Option<*mut SharedMemory> = None;
 static mut SHMEM_PHYS_ADDR : u64 = 0x0;
 const SHMEM_MAPPING_SIZE : usize = 0x2000;
 #[repr(packed)]
@@ -635,29 +615,6 @@ fn core_register_shmem(params: &mut RequestParams) -> Result<(), SvsmReqError> {
 		return Ok(());
 	}
 
-/*
-	let shmem = match unsafe { SHMEM } {
-		None => {
-			map_shmem(PhysAddr::new(params.rcx as usize), SHMEM_MAPPING_SIZE)?
-		},
-		Some(s) => {
-			unmap_shmem(s.into(), SHMEM_MAPPING_SIZE)?;
-			map_shmem(PhysAddr::new(params.rcx as usize), SHMEM_MAPPING_SIZE)?
-		}
-	};
-
-	unsafe {
-		SHMEM_SIZE = params.rdx as usize;
-		SHMEM = Some(shmem.as_mut_ptr::<SharedMemory>() as *mut SharedMemory);
-		log::info!("SHMEM : 0x{:x}", shmem);
-		match SHMEM {
-			Some(i) => {
-				log::info!("shmem.address : 0x{:x}", (*i).address);
-			},
-			None => {},
-		}
-	}
-// */
 	unsafe {
 		SHMEM_PHYS_ADDR = params.rcx;
 	}
@@ -666,6 +623,10 @@ fn core_register_shmem(params: &mut RequestParams) -> Result<(), SvsmReqError> {
 
 // do nothing
 fn core_nothing(_params: &mut RequestParams) -> Result<(), SvsmReqError> {
+	Ok(())
+}
+
+fn core_polling_agent(params : &mut RequestParams) -> Result<(), SvsmReqError> {
 	Ok(())
 }
 
@@ -683,6 +644,7 @@ pub fn core_protocol_request(request: u32, params: &mut RequestParams) -> Result
 				SVSM_REQ_CORE_CALL_TEST => core_call_test(params),
 				SVSM_REQ_CORE_WRITE_SHMEM => core_write_shmem(params),
 				SVSM_REQ_CORE_NOTHING => core_nothing(params),
+				SVSM_REQ_CORE_POLLING_AGENT => core_polling_agent(params),
         _ => Err(SvsmReqError::unsupported_call()),
     }
 }
