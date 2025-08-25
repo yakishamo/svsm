@@ -355,7 +355,6 @@ pub extern "C" fn svsm_main() {
         }
         crate::test_main();
     }
-
     match exec_user("/init", opendir("/").expect("Failed to find FS root")) {
         Ok(_) => (),
         Err(e) => log::info!("Failed to launch /init: {e:#?}"),

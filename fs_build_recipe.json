@@ -1,0 +1,9 @@
+{
+	"fs": {
+		"modules": {
+			"userinit": {
+				"path": "/init"
+      }
+    }
+  }
+}

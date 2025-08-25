@@ -78,6 +78,40 @@ impl PerCPUPageMappingGuard {
     pub fn create_4k(paddr: PhysAddr) -> Result<Self, SvsmError> {
         Self::create(paddr, paddr + PAGE_SIZE, 0)
     }
+    pub fn create_exec(
+        paddr_start: PhysAddr,
+        paddr_end: PhysAddr,
+        alignment: usize,
+    ) -> Result<Self, SvsmError> {
+        let align_mask = (PAGE_SIZE << alignment) - 1;
+        let size = paddr_end - paddr_start;
+        assert!((size & align_mask) == 0);
+        assert!((paddr_start.bits() & align_mask) == 0);
+        assert!((paddr_end.bits() & align_mask) == 0);
+
+        let flags = PTEntryFlags::exec_writable();
+        let huge = ((paddr_start.bits() & (PAGE_SIZE_2M - 1)) == 0)
+            && ((paddr_end.bits() & (PAGE_SIZE_2M - 1)) == 0);
+
+        let mapping = if huge {
+            let range = VRangeAlloc::new_2m(size, 0)?;
+            this_cpu()
+                .get_pgtable()
+                .map_region_2m(range.region(), paddr_start, flags, false)?;
+            range
+        } else {
+            let range = VRangeAlloc::new_4k(size, 0)?;
+            this_cpu()
+                .get_pgtable()
+                .map_region_4k(range.region(), paddr_start, flags, false)?;
+            range
+        };
+
+        Ok(Self { mapping })
+    }
+		pub fn create_exec_4k(paddr: PhysAddr) -> Result<Self, SvsmError> {
+				Self::create_exec(paddr, paddr + PAGE_SIZE, 0)
+		}
 
     /// Returns the virtual address associated with the guard.
     pub fn virt_addr(&self) -> VirtAddr {

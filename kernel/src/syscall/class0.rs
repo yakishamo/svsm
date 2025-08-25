@@ -9,7 +9,7 @@ use crate::address::VirtAddr;
 use crate::cpu::percpu::current_task;
 use crate::fs::find_dir;
 use crate::mm::guestmem::UserPtr;
-use crate::task::{current_task_terminated, exec_user, schedule};
+use crate::task::{current_task_terminated, exec_user, schedule, go_idle};
 use core::ffi::c_char;
 use syscall::SysCallError;
 
@@ -39,4 +39,14 @@ pub fn sys_close(obj_id: u32) -> Result<u64, SysCallError> {
     // if called with an invalid handle
     let _ = obj_close(obj_id.into());
     Ok(0)
+}
+
+pub fn sys_schedule() -> Result<u64, SysCallError> {
+	schedule();
+	Ok(0)
+}
+
+pub fn sys_idle() -> Result<u64, SysCallError> {
+	go_idle();
+	Ok(0)
 }

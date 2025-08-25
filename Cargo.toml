@@ -26,6 +26,7 @@ members = [
     "user/init",
     # Release version identifier
     "release",
+		"user/linked-list-allocator"
 ]
 
 
@@ -41,6 +42,7 @@ syscall = { path = "syscall" }
 packit = { path = "packit" }
 userlib = { path = "user/lib" }
 userinit = { path = "user/init" }
+linked_list_allocator = { path = "user/linked-list-allocator" }
 release = { path = "release" }
 
 # crates.io

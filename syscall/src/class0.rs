@@ -4,8 +4,8 @@
 //
 // Author: Chuanxiao Dong <chuanxiao.dong@intel.com>
 
-use super::call::{syscall1, syscall3, SysCallError};
-use super::{SYS_EXEC, SYS_EXIT};
+use super::call::{syscall0, syscall1, syscall3, SysCallError};
+use super::{SYS_EXEC, SYS_EXIT, SYS_SCHEDULE, SYS_IDLE};
 use core::ffi::CStr;
 
 pub fn exit(code: u32) -> ! {
@@ -36,4 +36,16 @@ pub fn exec(file: &CStr, root: &CStr, flags: u32) -> Result<Tid, SysCallError> {
         )
         .map(|ret| Tid(ret as u32))
     }
+}
+
+pub fn sched() -> Result<u64, SysCallError> {
+	unsafe {
+		syscall0(SYS_SCHEDULE)
+	}
+}
+
+pub fn idle() -> Result<u64, SysCallError> {
+	unsafe {
+		syscall0(SYS_IDLE)
+	}
 }

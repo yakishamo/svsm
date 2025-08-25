@@ -5,6 +5,15 @@ use userlib::*;
 
 use core::ptr::{addr_of, addr_of_mut};
 
+use linked_list_allocator::LockedHeap;
+
+#[global_allocator]
+static ALLOCATOR: LockedHeap = LockedHeap::empty();
+
+// Heap
+const  HEAP_SIZE: usize = 1024*1024;
+static mut HEAP: [u8; HEAP_SIZE] = [0;HEAP_SIZE];
+
 static mut SOME_BSS_DATA: [u64; 128] = [0; 128];
 static mut SOME_DATA: [u64; 128] = [0x01; 128];
 static SOME_RO_DATA: [u64; 128] = [0xee; 128];
@@ -26,7 +35,11 @@ fn write(arr: &mut [u64; 128], val: u64) {
 declare_main!(main);
 
 fn main() -> u32 {
+		unsafe {
+			ALLOCATOR.lock().init(addr_of_mut!(HEAP) as *mut u8, HEAP_SIZE);
+		}
     println!("COCONUT-SVSM init process starting");
+		println!("abc");
 
     // SAFETY: Single-threaded process, so no data races. Safe to access global
     // mutable data.
@@ -37,5 +50,5 @@ fn main() -> u32 {
         check(&*addr_of!(SOME_RO_DATA), 0xeeu64);
         check(&*addr_of!(SOME_BSS_DATA), 0xaa);
     }
-    0
+		0
 }

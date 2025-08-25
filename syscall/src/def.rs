@@ -15,6 +15,8 @@ const CLASS3: u64 = 3 << 32;
 pub const SYS_EXIT: u64 = CLASS0;
 pub const SYS_EXEC: u64 = CLASS0 + 4;
 pub const SYS_CLOSE: u64 = CLASS0 + 10;
+pub const SYS_SCHEDULE: u64 = CLASS0 + 11;
+pub const SYS_IDLE: u64 = CLASS0 + 12;
 
 // Syscall number in class1
 pub const SYS_OPEN: u64 = CLASS1;

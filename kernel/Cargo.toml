@@ -43,6 +43,8 @@ vstd = { workspace = true }
 verify_proof = { workspace = true, optional = true}
 verify_external = { workspace = true, optional = true}
 
+rbpf = { path = "/home/murakami/git/rbpf", default-features = false }
+
 [target."x86_64-unknown-none".dev-dependencies]
 test.workspace = true
 

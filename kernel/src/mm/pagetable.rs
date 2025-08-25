@@ -161,6 +161,10 @@ impl PTEntryFlags {
     pub fn task_data_ro() -> Self {
         Self::PRESENT | Self::NX | Self::ACCESSED
     }
+		
+		pub fn exec_writable() -> Self {
+				Self::PRESENT | Self::GLOBAL | Self::WRITABLE | Self::ACCESSED | Self::DIRTY
+		}
 }
 
 /// Represents paging mode.

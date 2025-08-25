@@ -1460,6 +1460,7 @@ pub extern "C" fn cpu_idle_loop() {
         let loop_name = format!("request-loop on CPU {}", apic_id);
         start_kernel_task(request_loop_main, loop_name)
             .expect("Failed to launch request loop task");
+
     }
 
     loop {
