@@ -350,7 +350,7 @@ extern "C" fn ex_handler_system_call(
         SYS_EXIT => sys_exit(ctxt.regs.rdi as u32),
         SYS_EXEC => sys_exec(ctxt.regs.rdi, ctxt.regs.rsi, ctxt.regs.r8),
         SYS_CLOSE => sys_close(ctxt.regs.rdi as u32),
-				SYS_SCHEDULE => sys_schedule(),
+        SYS_SCHEDULE => sys_schedule(),
         // Class 1 SysCalls.
         SYS_OPEN => sys_open(ctxt.regs.rdi, ctxt.regs.rsi, ctxt.regs.r8),
         SYS_READ => sys_read(ctxt.regs.rdi as u32, ctxt.regs.rsi, ctxt.regs.r8),

@@ -26,12 +26,14 @@ use crate::types::{PageSize, PAGE_SIZE, PAGE_SIZE_2M};
 use crate::utils::zero_mem_region;
 use cpuarch::vmsa::VMSA;
 
-use ::core::ptr::copy_nonoverlapping;
-use core::ptr;
 use crate::mm::alloc::allocate_page;
+use crate::mm::global_memory::{
+    map_global_range_4k_private, map_global_range_4k_shared, GlobalRangeGuard,
+};
+use crate::mm::pagetable::PTEntryFlags;
 use crate::mm::virt_to_phys;
-
-use crate::agent::shmem::SharedMemoryData;
+use core::ptr;
+use core::ptr::copy_nonoverlapping;
 
 const SVSM_REQ_CORE_REMAP_CA: u32 = 0;
 const SVSM_REQ_CORE_PVALIDATE: u32 = 1;
@@ -41,13 +43,11 @@ const SVSM_REQ_CORE_DEPOSIT_MEM: u32 = 4;
 const SVSM_REQ_CORE_WITHDRAW_MEM: u32 = 5;
 const SVSM_REQ_CORE_QUERY_PROTOCOL: u32 = 6;
 const SVSM_REQ_CORE_CONFIGURE_VTOM: u32 = 7;
-const SVSM_REQ_CORE_REGISTER_SHMEM : u32 = 8;
-const SVSM_REQ_CORE_TEST : u32 = 9;
-const SVSM_REQ_CORE_WRITE_SHMEM : u32 = 10;
-const SVSM_REQ_CORE_NOTHING : u32 = 11;
-
-const SVSM_REQ_CORE_RBPF : u32 = 13;
-const SVSM_REQ_CORE_P4 : u32 = 14;
+const SVSM_REQ_CORE_REGISTER_SHMEM: u32 = 8;
+const SVSM_REQ_CORE_TEST: u32 = 9;
+const SVSM_REQ_CORE_WRITE_SHMEM: u32 = 10;
+const SVSM_REQ_CORE_NOTHING: u32 = 11;
+const SVSM_REQ_CORE_RBPF: u32 = 13;
 
 const CORE_PROTOCOL_VERSION_MIN: u32 = 1;
 const CORE_PROTOCOL_VERSION_MAX: u32 = 1;
@@ -437,389 +437,564 @@ fn core_remap_ca(params: &RequestParams) -> Result<(), SvsmReqError> {
     Ok(())
 }
 
-fn read_phys(phys_addr : u64) -> Result<u64, SvsmReqError> {
-	let phys_addr = PhysAddr::from(phys_addr);
-	let offset = phys_addr.page_offset();
-	let paddr = phys_addr.page_align();
-	let guard = PerCPUPageMappingGuard::create_4k(paddr)?;
-	let start = guard.virt_addr();
-	let vaddr = GuestPtr::<u64>::new(start + offset);
-	Ok( unsafe{ vaddr.read()? } )
+fn read_phys(phys_addr: u64) -> Result<u64, SvsmReqError> {
+    let phys_addr = PhysAddr::from(phys_addr);
+    let offset = phys_addr.page_offset();
+    let paddr = phys_addr.page_align();
+    let guard = PerCPUPageMappingGuard::create_4k(paddr)?;
+    let start = guard.virt_addr();
+    let vaddr = GuestPtr::<u64>::new(start + offset);
+    Ok(unsafe { vaddr.read()? })
 }
 
-unsafe fn copy_guest_4k(phys_addr : u64, dst : u64) -> Result<(), SvsmReqError> {
-	let dst = dst & 0xfffffffffffff000;
-	let dst = dst as *mut u8;
-	let phys_addr = PhysAddr::from(phys_addr).page_align();
-	let mapping_guard = PerCPUPageMappingGuard::create_4k(phys_addr)?;
-	let start = mapping_guard.virt_addr();
-	let src = start.as_ptr() as *const u8;
-	unsafe { copy_nonoverlapping(src, dst, 4096) };
-	Ok(())
+unsafe fn copy_guest_4k(phys_addr: u64, dst: u64) -> Result<(), SvsmReqError> {
+    let dst = dst & 0xfffffffffffff000;
+    let dst = dst as *mut u8;
+    let phys_addr = PhysAddr::from(phys_addr).page_align();
+    let mapping_guard = PerCPUPageMappingGuard::create_4k(phys_addr)?;
+    let start = mapping_guard.virt_addr();
+    let src = start.as_ptr() as *const u8;
+    unsafe { copy_nonoverlapping(src, dst, 4096) };
+    Ok(())
 }
 
-fn translate_guestmem(addr: u64) -> Result<u64, SvsmReqError> {
-	let mut vmsa_ref = this_cpu().guest_vmsa_ref();
-	let vmsa = vmsa_ref.vmsa();
-	let cr3 = vmsa.cr3;	
+fn translate_guestmem(addr: VirtAddr) -> PhysAddr {
+    let mut vmsa_ref = this_cpu().guest_vmsa_ref();
+    let vmsa = vmsa_ref.vmsa();
+    let cr3 = vmsa.cr3;
 
-	let l4page_ent_offset = ((addr >> 39) & 0b1_11111111)*8; //9bits mask
-	let l4page_ent = cr3 + l4page_ent_offset;
-	let mut l4page_ent = read_phys(l4page_ent)?;
-	l4page_ent &= 0x000f_ffff_ffff_f000;
+    let addr = addr.bits() as u64;
 
-	let l3page_ent_offset = ((addr >> 30) & 0b1_11111111)*8;
-	let l3page_ent = l4page_ent + l3page_ent_offset;
-	let mut l3page_ent = read_phys(l3page_ent)?;
-	l3page_ent &= 0x000f_ffff_ffff_f000;
+    let l4page_ent_offset = ((addr >> 39) & 0b1_11111111) * 8; //9bits mask
+    let l4page_ent = cr3 + l4page_ent_offset;
+    let mut l4page_ent = read_phys(l4page_ent).unwrap();
+    l4page_ent &= 0x000f_ffff_ffff_f000;
 
-	let l2page_ent_offset = ((addr >> 21) & 0b1_11111111)*8;
-	let l2page_ent = l3page_ent + l2page_ent_offset;
-	let mut l2page_ent = read_phys(l2page_ent)?;
-	if ((l2page_ent >> 7)&0x1) == 1 {
-		l2page_ent &= 0x000f_ffff_ffe0_0000;
-		let phys_offset = addr & 0x1fffff;
-		let phys_addr = l2page_ent | phys_offset;
-/*
-		return match read_phys(phys_addr) {
-			Ok(num) => {
-				Ok(num)
-			},
-			Err(e) => Err(e),
-		}
-		*/
-		return Ok(phys_addr);
-	}
-	l2page_ent &= 0x000f_ffff_ffff_f000;
+    let l3page_ent_offset = ((addr >> 30) & 0b1_11111111) * 8;
+    let l3page_ent = l4page_ent + l3page_ent_offset;
+    let mut l3page_ent = read_phys(l3page_ent).unwrap();
+    l3page_ent &= 0x000f_ffff_ffff_f000;
 
-	let l1page_ent_offset = ((addr >> 12) & 0b1_11111111)*8;
-	let l1page_ent = l2page_ent + l1page_ent_offset;
-	let mut l1page_ent = read_phys(l1page_ent)?;
-	l1page_ent &= 0x000f_ffff_ffff_f000;
+    let l2page_ent_offset = ((addr >> 21) & 0b1_11111111) * 8;
+    let l2page_ent = l3page_ent + l2page_ent_offset;
+    let mut l2page_ent = read_phys(l2page_ent).unwrap();
+    if ((l2page_ent >> 7) & 0x1) == 1 {
+        l2page_ent &= 0x000f_ffff_ffe0_0000;
+        let phys_offset = addr & 0x1fffff;
+        let phys_addr = l2page_ent | phys_offset;
+        return PhysAddr::from(phys_addr);
+    }
+    l2page_ent &= 0x000f_ffff_ffff_f000;
 
-	let phys_offset = addr & 0x0fff;
-	let phys_addr = l1page_ent + phys_offset;
-	Ok(phys_addr)
+    let l1page_ent_offset = ((addr >> 12) & 0b1_11111111) * 8;
+    let l1page_ent = l2page_ent + l1page_ent_offset;
+    let mut l1page_ent = read_phys(l1page_ent).unwrap();
+    l1page_ent &= 0x000f_ffff_ffff_f000;
+
+    let phys_offset = addr & 0x0fff;
+    let phys_addr = l1page_ent + phys_offset;
+    PhysAddr::from(phys_addr)
 }
 
-static SHMEM_MAPPING: RWLock<Option<PerCPUPageMappingGuard>> = RWLock::new(None);
-static SHMEM_DATA: RWLock<Option<&mut SharedMemoryData>> = RWLock::new(None);
-fn map_shmem() -> u64 {
-	let phys_addr = unsafe { PhysAddr::from(SHMEM_PHYS_ADDR) };
-	let align = phys_addr.page_align();
-	let offset = phys_addr.page_offset();
-	let mut guard = SHMEM_MAPPING.lock_write();
-	if guard.is_none() {
-		*guard = Some(
-			match PerCPUPageMappingGuard::create(align, align + PAGE_SIZE*2, 0) {
-				Ok(g) => {
-					g
-					},
-				Err(_e) => {
-					log::info!("PerCPUPageMapping::create() failed in map_shmem");
-					return 0;
-				}
-			}
-		);
-	}
-	let ptr_virt = guard.as_ref().unwrap().virt_addr() + offset;
-	let ptr_raw = ptr_virt.into();
-	let ptr_virt = VirtAddr::from(ptr_raw);
-	let _ = this_cpu()
-		.get_pgtable()
-		.set_shared_4k(ptr_virt + offset);
-	let _ = this_cpu()
-		.get_pgtable()
-		.set_shared_4k(ptr_virt + offset + PAGE_SIZE);
+#[warn(dead_code)]
+static GLOBAL_RANGE_GUARD: RWLock<Option<GlobalRangeGuard>> = RWLock::new(None);
+fn map_global_private(phys_addr: PhysAddr, flags: PTEntryFlags) -> Result<VirtAddr, SvsmError> {
+    log::info!("map_global_private called");
+    let size = PAGE_SIZE;
+    if !phys_addr.is_page_aligned() {
+        log::info!("map_global_private: phys_addr is not page alidned");
+        return Err(SvsmError::Fault);
+    }
 
-	let mut shmem = SHMEM_DATA.lock_write();
-	if shmem.is_none() {
-		*shmem = Some( unsafe{ &mut *ptr_virt.as_mut_ptr::<SharedMemoryData>() } )
-	}
-	ptr_raw
+    let global_range_local = map_global_range_4k_private(phys_addr, size, flags)?;
+    let virt_addr = global_range_local.addr();
+    let mut global_range = GLOBAL_RANGE_GUARD.lock_write();
+    *global_range = Some(global_range_local);
+    log::info!("end of map_global_private");
+    Ok(virt_addr)
 }
 
-fn unmap_shmem() {
-	let mut guard = SHMEM_MAPPING.lock_write();
-	*guard = None;
-	let mut shmem = SHMEM_DATA.lock_write();
-	*shmem = None;
-}
+static OS_MAPPING: RWLock<Option<GlobalRangeGuard>> = RWLock::new(None);
+fn map_os() -> Result<VirtAddr, SvsmError> {
+    let os_virt: u64 = 0xffffffff82598700;
+    let phys_addr = translate_guestmem(VirtAddr::from(os_virt));
+    let flags = PTEntryFlags::data();
+    let size = PAGE_SIZE;
+    let global_range = map_global_range_4k_private(phys_addr.page_align(), size, flags)?;
+    let virt_addr = global_range.addr();
+    let mut mapping = OS_MAPPING.lock_write();
+    *mapping = Some(global_range);
 
+    Ok(virt_addr + phys_addr.page_offset())
+}
 
 // dump params
-fn core_test(_params: &mut RequestParams) -> Result<(), SvsmReqError> {
-	let shmem_addr = map_shmem();
-	log::info!("shmem_addr: {:x}", shmem_addr);
-	let shmem_addr = shmem_addr as *mut u64;
-	unsafe {
-		*shmem_addr = 0x1122eeff;
-		log::info!("*shmem_addr: {:x}", *shmem_addr);
-	}
-	let mut shmem = SHMEM_DATA.lock_write();
-	log::info!("shmem.address: {:x}", unsafe{ shmem.as_mut().unwrap().address });
-	Ok(())
+fn core_test(params: &mut RequestParams) -> Result<(), SvsmReqError> {
+    let mut linux_banner_lock = LINUX_BANNER_VIRT.lock_write();
+    if *linux_banner_lock == None {
+        let virt_addr = match map_os() {
+            Ok(v) => v,
+            Err(_e) => {
+                log::info!("map_os failed");
+                return Err(SvsmReqError::invalid_request());
+            }
+        };
+        *linux_banner_lock = Some(virt_addr);
+    }
+    let linux_banner = (*linux_banner_lock).unwrap().as_ptr::<u64>();
+    log::info!("linux_banner: 0x{:x}", unsafe { *linux_banner });
+    if params.rcx != 0 {
+        *linux_banner_lock = None;
+    }
+
+    Ok(())
 }
 
+/*
 // no input
 fn core_write_shmem(_params: &mut RequestParams) -> Result<(), SvsmReqError> {
-	// mapping shared memory
-	unsafe {
-		if SHMEM_PHYS_ADDR == 0 {
-			log::info!("SHMEM_PHYS_ADDR not set");
-			return Err(SvsmReqError::invalid_parameter());
-		}
-	}
-	let phys_addr = unsafe { PhysAddr::from(SHMEM_PHYS_ADDR & 0x0000_ffff_ffff_ffff) };
-	if phys_addr == PhysAddr(0x0) {
-		log::info!("cannot read 0x{:x}", phys_addr);
-		return Err(SvsmReqError::invalid_parameter());
-	}
+    // mapping shared memory
+    let Some(phys_addr) = *SHMEM_PHYS_ADDR.lock_write() else {
+        log::info!("shared memory physical address is not registered.");
+        return Err(SvsmReqError::invalid_parameter());
+    };
 
-	let offset = phys_addr.page_offset();
-	let paddr = phys_addr.page_align();
-	let guard = PerCPUPageMappingGuard::create(paddr, paddr + PAGE_SIZE*2, 0)?;
-	let start = guard.virt_addr();
-	this_cpu()
-		.get_pgtable()
-		.set_shared_4k(start + offset)?;
-	this_cpu()
-		.get_pgtable()
-		.set_shared_4k(start + offset + PAGE_SIZE)?;
-	
-	let shmem : *mut SharedMemoryData = 
-		(start + offset).as_mut_ptr::<SharedMemoryData>() as *mut SharedMemoryData;
+    let offset = phys_addr.page_offset();
+    let paddr = phys_addr.page_align();
+    let guard = PerCPUPageMappingGuard::create(paddr, paddr + PAGE_SIZE*2, 0)?;
+    let start = guard.virt_addr();
+    this_cpu()
+        .get_pgtable()
+        .set_shared_4k(start + offset)?;
+    this_cpu()
+        .get_pgtable()
+        .set_shared_4k(start + offset + PAGE_SIZE)?;
 
-	let target_guest_addr = unsafe{(*shmem).address} & 0xfffffffffffff000;
+    let shmem : *mut SharedMemoryData =
+        (start + offset).as_mut_ptr::<SharedMemoryData>() as *mut SharedMemoryData;
 
-	let target_phys_addr = match translate_guestmem(target_guest_addr) {
-		Ok(a) => a,
-		Err(e) => {
-			log::info!("translate_guestmem(guest_vaddr) error");
-			return Err(e);
-		}
-	};
-	unsafe {
-		copy_guest_4k(target_phys_addr, shmem as u64 + 4096)?;
-	}
-	Ok(())
+    let target_guest_addr = unsafe{(*shmem).address} & 0xfffffffffffff000;
+
+    let target_phys_addr = translate_guestmem(VirtAddr::from(target_guest_addr));
+    unsafe {
+        copy_guest_4k(target_phys_addr.bits() as u64, shmem as u64 + 4096)?;
+    }
+    Ok(())
+}
+*/
+
+fn core_write_shmem(_params: &mut RequestParams) -> Result<(), SvsmReqError> {
+    let prog = [
+        0x85, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x95, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00,
+    ];
+    let Ok(mut vm) = EbpfVmNoData::new(Some(&prog)) else {
+        log::info!("cannot create vm");
+        return Err(SvsmReqError::invalid_request());
+    };
+
+    let _ = vm.register_helper(BPF_GET_SHMEM_VIRT, bpf_get_shmem_virt);
+    let _ = vm.register_helper(BPF_GET_OS_VIRT, bpf_get_os_virt);
+    let _ = vm.register_helper(BPF_PRINT_VALUE, bpf_print_value);
+
+    // register shared memory and guest os memory
+    {
+        let shmem = SHMEM_VIRT_ADDR.lock_write();
+        if *shmem == None {
+            log::info!("shmem is not mapped");
+            return Err(SvsmReqError::invalid_request());
+        }
+        let shmem_start = (*shmem).unwrap().bits() as u64;
+        let shmem_end = shmem_start + 4096 * 2;
+
+        let linux_banner = LINUX_BANNER_VIRT.lock_write();
+        if *linux_banner == None {
+            log::info!("os memory is not mapped on SVSM");
+            return Err(SvsmReqError::invalid_request());
+        }
+        let linux_start = (*linux_banner).unwrap().bits() as u64;
+        let linux_end = linux_start + 0x1000 - 0x700;
+
+        vm.register_allowed_memory(shmem_start..shmem_end);
+        vm.register_allowed_memory(linux_start..linux_end);
+    }
+    // lock release
+
+    let jit_mem_virt = allocate_page();
+
+    let jit_mem_phys = virt_to_phys(jit_mem_virt.unwrap());
+    let Ok(jit_mem_guard) = PerCPUPageMappingGuard::create_exec_4k(jit_mem_phys) else {
+        log::info!("failed to allocate exec page");
+        return Err(SvsmReqError::invalid_request());
+    };
+    let jit_mem_virt = jit_mem_guard.virt_addr();
+    let jit_mem_raw = jit_mem_virt.as_mut_ptr::<u8>();
+    let jit_mem = unsafe { &mut *ptr::slice_from_raw_parts_mut(jit_mem_raw, PAGE_SIZE) };
+    let _ = vm.set_jit_exec_memory(jit_mem);
+    let _ = vm.jit_compile();
+
+    match unsafe { vm.execute_program_jit() } {
+        Err(_e) => {
+            log::info!("failed to execute bpf");
+            return Err(SvsmReqError::invalid_request());
+        }
+        _ => {}
+    };
+    Ok(())
 }
 
-static mut SHMEM_PHYS_ADDR : u64 = 0x0;
-const SHMEM_MAPPING_SIZE : usize = 0x2000;
+#[repr(C, packed)]
+#[derive(Copy, Clone)]
+struct SHMEM {
+    address: u64,
+    size: u64,
+    flag: u64,
+    value: u64,
+}
 
+const BPF_GET_SHMEM_VIRT: u32 = 1;
+fn bpf_get_shmem_virt(v: u64, _: u64, _: u64, _: u64, _: u64) -> u64 {
+    log::info!("bpf_get_shmem_virt");
+    let virt = SHMEM_VIRT_ADDR.lock_write();
+    if *virt == None {
+        return 0;
+    }
+    log::info!("write value");
+    unsafe {
+        let value = (*virt).unwrap().as_mut_ptr::<SHMEM>();
+        (*value).value = v;
+        (*value).flag = 2;
+    }
+    0
+}
+
+const BPF_GET_OS_VIRT: u32 = 2;
+fn bpf_get_os_virt(_: u64, _: u64, _: u64, _: u64, _: u64) -> u64 {
+    let virt = LINUX_BANNER_VIRT.lock_write();
+    if *virt == None {
+        return 0;
+    }
+    let value = (*virt).unwrap().as_ptr::<u64>();
+    unsafe { *value }
+}
+
+const BPF_PRINT_VALUE: u32 = 3;
+fn bpf_print_value(value: u64, _: u64, _: u64, _: u64, _: u64) -> u64 {
+    log::info!("bpf_print_value: 0x{:x}", value);
+    0
+}
+
+static SHMEM_PHYS_ADDR: RWLock<Option<PhysAddr>> = RWLock::new(None);
+static SHMEM_VIRT_ADDR: RWLock<Option<VirtAddr>> = RWLock::new(None);
+const SHMEM_MAPPING_SIZE: usize = 0x2000;
+static SHMEM_MAPPING_GUARD: RWLock<Option<GlobalRangeGuard>> = RWLock::new(None);
+static LINUX_BANNER_VIRT: RWLock<Option<VirtAddr>> = RWLock::new(None);
 // rcx : [IN] shared memory physical address
 // rdx : [IN] shared memory size
 fn core_register_shmem(params: &mut RequestParams) -> Result<(), SvsmReqError> {
-	log::info!("register_shmem called");
-	log::info!("shmem : 0x{:x}", params.rcx);
-	log::info!("shmem_size : 0x{:x}", params.rdx);
+    log::info!("register_shmem called");
+    log::info!("shmem : 0x{:x}", params.rcx);
+    log::info!("shmem_size : 0x{:x}", params.rdx);
 
-	if params.rdx < SHMEM_MAPPING_SIZE as u64 {
-		log::info!("shmem_size is not enough");
-		return Ok(());
-	}
+    {
+        let mut linux_banner = LINUX_BANNER_VIRT.lock_write();
+        if *linux_banner == None {
+            log::info!("call map_os()");
+            let os_virt = match map_os() {
+                Ok(v) => v,
+                Err(_e) => {
+                    log::info!("failed to map os memory");
+                    return Err(SvsmReqError::invalid_request());
+                }
+            };
+            *linux_banner = Some(os_virt)
+        }
+    }
 
-	unsafe {
-		SHMEM_PHYS_ADDR = params.rcx;
-	}
-	Ok(())
+    log::info!("get linux_banner virtual address");
+
+    if params.rdx < SHMEM_MAPPING_SIZE as u64 {
+        log::info!("shmem_size is not enough");
+        return Ok(());
+    }
+
+    let mut shmem_phys = SHMEM_PHYS_ADDR.lock_write();
+    *shmem_phys = Some(PhysAddr::from(params.rcx));
+
+    // map shmem
+    {
+        let mut shmem_virt = SHMEM_VIRT_ADDR.lock_write();
+        let mut shmem_guard = SHMEM_MAPPING_GUARD.lock_write();
+        let flags = PTEntryFlags::data();
+        *shmem_guard = Some(
+            map_global_range_4k_shared((*shmem_phys).unwrap(), SHMEM_MAPPING_SIZE * 2, flags)
+                .unwrap(),
+        );
+        *shmem_virt = Some(shmem_guard.as_ref().unwrap().addr());
+    }
+
+    let linux_banner = LINUX_BANNER_VIRT.lock_write();
+    if *linux_banner == None {
+        log::info!("linux_banner is not set");
+        return Err(SvsmReqError::invalid_request());
+    }
+    let linux_banner = (*linux_banner).unwrap().as_ptr::<u64>() as *const u64;
+    log::info!("linux_banner: {:p}", linux_banner);
+    log::info!("*linux_banner: 0x{:x}", unsafe { *linux_banner });
+
+    Ok(())
 }
 
 // do nothing
 fn core_nothing(_params: &mut RequestParams) -> Result<(), SvsmReqError> {
-	Ok(())
+    Ok(())
 }
 
 #[repr(C, packed)]
 #[derive(Copy, Clone)]
 
 struct BpfShmem {
-	flag_request: u64,
-	flag_accept: u64,
-	buf: [u8;128],
+    flag_request: u64,
+    flag_accept: u64,
+    buf: [u8; 128],
 }
 
 use rbpf::*;
 fn core_rbpf() -> Result<(), SvsmReqError> {
+    let prog = [
+        0x85, 0x10, 0x00, 0x00, 0x1b, 0x00, 0x00, 0x00, 0xb7, 0x06, 0x00, 0x00, 0x40, 0xfe, 0xc0,
+        0x82, 0xb7, 0x07, 0x00, 0x00, 0x95, 0x00, 0x00, 0x00, 0xb7, 0x01, 0x00, 0x00, 0x40, 0xfe,
+        0xc0, 0x82, 0x85, 0x00, 0x00, 0x00, 0x0d, 0x00, 0x00, 0x00, 0xbf, 0x61, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x07, 0x01, 0x00, 0x00, 0xc0, 0x09, 0x00, 0x00, 0xb7, 0x02, 0x00, 0x00,
+        0x04, 0x00, 0x00, 0x00, 0x85, 0x10, 0x00, 0x00, 0x17, 0x00, 0x00, 0x00, 0x61, 0x01, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x67, 0x01, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0xc7, 0x01,
+        0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x85, 0x00, 0x00, 0x00, 0x0d, 0x00, 0x00, 0x00, 0x07,
+        0x06, 0x00, 0x00, 0xf0, 0x08, 0x00, 0x00, 0xbf, 0x61, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0xb7, 0x02, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x85, 0x10, 0x00, 0x00, 0x0f, 0x00, 0x00,
+        0x00, 0xbf, 0x71, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x67, 0x01, 0x00, 0x00, 0x20, 0x00,
+        0x00, 0x00, 0x77, 0x01, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x15, 0x01, 0x04, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x07, 0x07, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0x79, 0x06, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x07, 0x06, 0x00, 0x00, 0x10, 0xf7, 0xff, 0xff, 0x55, 0x06, 0xea,
+        0xff, 0x40, 0xfe, 0xc0, 0x82, 0x85, 0x10, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0xb7, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x95, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x95,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x95, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x85, 0x00, 0x00, 0x00, 0x0d, 0x00, 0x00, 0x00, 0x95, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0xbf, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xb7, 0x01, 0x00, 0x00, 0x64, 0x00,
+        0x00, 0x00, 0x2d, 0x01, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x85, 0x00, 0x00, 0x00, 0x0c,
+        0x00, 0x00, 0x00, 0xbf, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x95, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0xb7, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x95, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
 
-	use rbpf::assembler::assemble;
-	let prog = assemble(
-	"mov64 r1, 0x1
-	 call 0xa
-	 mov64 r6, r0
-	 mov64 r1, 0xffffffff83749a40
-	 call 0xb
-	 exit").unwrap();
+    let mut vm = match EbpfVmNoData::new(Some(&prog)) {
+        Ok(v) => v,
+        Err(_e) => {
+            log::info!("create vm failed.");
+            log::info!("check your bpf code.");
+            return Err(SvsmReqError::invalid_request());
+        }
+    };
 
-	let mut vm = match EbpfVmNoData::new(Some(&prog)) {
-		Ok(v) => v,
-		Err(_e) => {
-			log::info!("create vm failed.");
-			log::info!("check your bpf code.");
-			return Err(SvsmReqError::invalid_request());
-		}
-	};
-//
-// register helper function
-//
-	match vm.register_helper(BPF_GET_SHMEM, bpf_get_shmem) {
-		Err(_e) => {
-			log::info!("register_helper failed(bpf_get_shmem).");
-			return Err(SvsmReqError::invalid_request());
-		},
-		_ => {},
-	};
+    // register helper function
+    match vm.register_helper(BPF_GET_SHMEM, bpf_get_shmem) {
+        Err(_e) => {
+            log::info!("register_helper failed(bpf_get_shmem).");
+            return Err(SvsmReqError::invalid_request());
+        }
+        _ => {}
+    };
 
-	match vm.register_helper(BPF_GET_OS, bpf_get_os) {
-		Err(_e) => {
-			log::info!("register_helper failed(bpf_get_os).");
-			return Err(SvsmReqError::invalid_request());
-		},
-		_ => {},
-	};
-// */
-	
-	// allocate jit exec memory
-	let jit_mem_virt = match allocate_page() {
-		Ok(addr) => {
-			addr
-		},
-		Err(_e) => {
-			log::info!("failed to allocate page for jit execution");
-			return Err(SvsmReqError::invalid_request());
-		},
-	};
+    match vm.register_helper(BPF_GET_OS, bpf_get_os) {
+        Err(_e) => {
+            log::info!("register_helper failed(bpf_get_os).");
+            return Err(SvsmReqError::invalid_request());
+        }
+        _ => {}
+    };
 
-	let jit_mem_phys = virt_to_phys(jit_mem_virt);
-	let jit_mem_guard = 
-		PerCPUPageMappingGuard::create_exec_4k(jit_mem_phys) else {
-			log::info!("failed to allocate exec page");
-			return Err(SvsmReqError::invalid_request());
-		};
-	let jit_mem_guard = jit_mem_guard.unwrap();
-	let jit_mem_virt = jit_mem_guard.virt_addr();
-	let jit_mem_raw = jit_mem_virt.as_mut_ptr::<u8>();
-	let jit_mem = unsafe {
-		&mut *ptr::slice_from_raw_parts_mut(jit_mem_raw, PAGE_SIZE)
-	};
+    match vm.register_helper(BPF_G_MAP, bpf_g_map) {
+        Err(_e) => {
+            log::info!("register_helper failed(bpf_g_map).");
+            return Err(SvsmReqError::invalid_request());
+        }
+        _ => {}
+    };
 
-	let _ = vm.set_jit_exec_memory(jit_mem);
+    match vm.register_helper(BPF_PRINT, bpf_print) {
+        Err(_e) => {
+            log::info!("register_helper failed(bpf_print).");
+            return Err(SvsmReqError::invalid_request());
+        }
+        _ => {}
+    };
 
-	match vm.jit_compile() {
-		Err(_e) => {
-			log::info!("failed to jit compile");
-			return Err(SvsmReqError::invalid_request());
-		},
-		_ => {},
-	}
+    vm.register_allowed_memory(0..0xffffffffffffffff);
 
-	let result = unsafe {
-		vm.execute_program_jit().unwrap()
-	};
-	let _ = bpf_get_shmem(0,0,0,0,0);
-	let vaddr = SHMEM_VADDR.lock_write();
-	let shmem = unsafe{ &mut *vaddr.unwrap().as_mut_ptr::<BpfShmem>() };	
-	if result == 0 {
-		(*shmem).flag_accept = 1;
-	} else {
-		(*shmem).flag_accept = 0;
-	}
-	(*shmem).flag_request = 2;
-	log::info!("result: {}", result);
-	drop(vaddr);
-	destroy_mapping();
-	Ok(())
+    /*
+    // allocate jit exec memory
+    let jit_mem_virt = match allocate_page() {
+        Ok(addr) => {
+            addr
+        },
+        Err(_e) => {
+            log::info!("failed to allocate page for jit execution");
+            return Err(SvsmReqError::invalid_request());
+        },
+    };
+
+    let jit_mem_phys = virt_to_phys(jit_mem_virt);
+    let Ok(jit_mem_guard) =
+        PerCPUPageMappingGuard::create_exec_4k(jit_mem_phys) else {
+            log::info!("failed to allocate exec page");
+            return Err(SvsmReqError::invalid_request());
+        };
+    // let jit_mem_guard = jit_mem_guard.unwrap();
+    let jit_mem_virt = jit_mem_guard.virt_addr();
+    let jit_mem_raw = jit_mem_virt.as_mut_ptr::<u8>();
+    let jit_mem = unsafe {
+        &mut *ptr::slice_from_raw_parts_mut(jit_mem_raw, PAGE_SIZE)
+    };
+
+    let _ = vm.set_jit_exec_memory(jit_mem);
+
+    match vm.jit_compile() {
+        Err(_e) => {
+            log::info!("failed to jit compile");
+            return Err(SvsmReqError::invalid_request());
+        },
+        _ => {},
+    }
+
+    let result = unsafe {
+        vm.execute_program_jit().unwrap()
+    };
+    // let _ = bpf_get_shmem(0,0,0,0,0);
+    */
+
+    let result = match vm.execute_program() {
+        Ok(r) => r,
+        Err(e) => {
+            log::info!("BPF execution Error: {:?}", e);
+            return Err(SvsmReqError::invalid_request());
+        }
+    };
+
+    /*
+    let vaddr = SHMEM_VADDR.lock_write();
+    let shmem = unsafe{ &mut *vaddr.unwrap().as_mut_ptr::<BpfShmem>() };
+    if result == 0 {
+        (*shmem).flag_accept = 1;
+    } else {
+        (*shmem).flag_accept = 0;
+    }
+    (*shmem).flag_request = 2;
+    log::info!("result: {}", result);
+    drop(vaddr);
+    destroy_mapping();
+    */
+    log::info!("rbpf result: {}", result);
+    Ok(())
 }
 
 const BPF_GET_SHMEM: u32 = 10;
-static SHMEM_MAPPING_GUARD: RWLock<Option<PerCPUPageMappingGuard>> = RWLock::new(None);
 static SHMEM_VADDR: RWLock<Option<VirtAddr>> = RWLock::new(None);
-fn bpf_get_shmem(index: u64, _: u64, _: u64, _:u64, _:u64) -> u64 {
-	let mut vaddr = SHMEM_VADDR.lock_write();
-	if vaddr.is_none() {
-		let phys_addr = unsafe { PhysAddr::from(SHMEM_PHYS_ADDR) };
-		let align = phys_addr.page_align();
-		let phys_offset = phys_addr.page_offset();
-		let mut guard = SHMEM_MAPPING_GUARD.lock_write();
-		*guard = Some(
-			match PerCPUPageMappingGuard::create(align, align + PAGE_SIZE, 0) {
-				Ok(g) => g,
-				Err(_e) => {
-					log::info!("PerCPUPageMapping::create() failed in bpf_map_shmem");
-					return 0;
-				}
-			}
-		);
-		let ptr_raw: u64 = (guard.as_ref().unwrap().virt_addr() + phys_offset).into();
-		*vaddr = Some(VirtAddr::from(ptr_raw));
-		let _ = this_cpu()
-			.get_pgtable()
-			.set_shared_4k((*vaddr).unwrap() + phys_offset);
-	}
-	
-	let shmem = unsafe{ &mut *vaddr.unwrap().as_mut_ptr::<[u64;512]>()};
-	let ret = shmem[index as usize];
-	return ret;
+fn bpf_get_shmem(index: u64, _: u64, _: u64, _: u64, _: u64) -> u64 {
+    /*
+    let mut vaddr = SHMEM_VADDR.lock_write();
+    if vaddr.is_none() {
+        let Some(phys_addr) = *SHMEM_PHYS_ADDR.lock_write() else {
+            log::info!("shared memory physical address is not registered.");
+            return 0;
+        };
+        let align = phys_addr.page_align();
+        let phys_offset = phys_addr.page_offset();
+        let mut guard = SHMEM_MAPPING_GUARD.lock_write();
+        if *guard == None {
+            *guard = Some(
+                match PerCPUPageMappingGuard::create(align, align + PAGE_SIZE, 0) {
+                    Ok(g) => g,
+                    Err(_e) => {
+                        log::info!("PerCPUPageMapping::create() failed in bpf_map_shmem");
+                        return 0;
+                    }
+                });
+        }
+        let ptr_raw: u64 = (guard.as_ref().unwrap().virt_addr() + phys_offset).into();
+        *vaddr = Some(VirtAddr::from(ptr_raw));
+        let _ = this_cpu()
+            .get_pgtable()
+            .set_shared_4k((*vaddr).unwrap() + phys_offset);
+    }
+
+    let shmem = unsafe{ &mut *vaddr.unwrap().as_mut_ptr::<[u64;512]>()};
+    let ret = shmem[index as usize];
+    return ret;
+    */
+    return 0;
 }
 
 const BPF_GET_OS: u32 = 11;
-fn bpf_get_os(os_virt_addr: u64, _: u64, _: u64, _:u64, _:u64) -> u64 {
-	let phys_addr = match translate_guestmem(os_virt_addr) {
-		Ok(a) => PhysAddr::from(a),
-		Err(_) => {
-			log::info!("translate_guestmem(os_virt_addr) failed in bpf_map_os");
-			return 0;
-		}
-	};
-	let align = phys_addr.page_align();
-	let offset = phys_addr.page_offset();
-	let guard = PerCPUPageMappingGuard::create(align, align + PAGE_SIZE*2, 0);
-	let ptr_raw:u64 = (guard.as_ref().unwrap().virt_addr() + offset).into();
-	let vaddr = VirtAddr::from(ptr_raw);
-	let target = unsafe{ &mut *vaddr.as_mut_ptr::<u64>() };
-	log::info!("*0x{:x}: {}", vaddr, *target);
-	return *target;
+fn bpf_get_os(os_virt_addr: u64, _: u64, _: u64, _: u64, _: u64) -> u64 {
+    let phys_addr = translate_guestmem(VirtAddr::from(os_virt_addr));
+    let align = phys_addr.page_align();
+    let offset = phys_addr.page_offset();
+    let guard = PerCPUPageMappingGuard::create(align, align + PAGE_SIZE * 2, 0);
+    let ptr_raw: u64 = (guard.as_ref().unwrap().virt_addr() + offset).into();
+    let vaddr = VirtAddr::from(ptr_raw);
+    let target = unsafe { &mut *vaddr.as_mut_ptr::<u64>() };
+    log::info!("*0x{:x}: {}", vaddr, *target);
+    return *target;
+}
+
+static OS_GUARD: RWLock<Option<PerCPUPageMappingGuard>> = RWLock::new(None);
+const BPF_G_MAP: u32 = 12;
+fn bpf_g_map(addr: u64, size: u64, _: u64, _: u64, _: u64) -> u64 {
+    log::info!("-- bpf_g_map called --");
+    //	log::info!("addr: 0x{:x}", addr);
+    //	log::info!("size: 0x{:x}", size);
+
+    use crate::mm::pagetable::PageTable;
+    match PageTable::virt_to_frame(VirtAddr::from(addr)) {
+        Some(_) => {
+            //			log::info!("SVSM Virt Addr");
+            return addr;
+        }
+        None => {
+            //			log::info!("guest OS Virt Addr");
+        }
+    };
+
+    let paddr = translate_guestmem(VirtAddr::from(addr));
+    //	log::info!("paddr: 0x{:x}", paddr);
+    let offset = paddr.page_offset() as u64;
+    let align = paddr.page_align();
+    let mut guard = OS_GUARD.lock_write();
+    let guard_raw = match PerCPUPageMappingGuard::create_4k(align) {
+        Ok(g) => g,
+        Err(e) => {
+            log::info!("g_map error: {:?}", e);
+            return 0;
+        }
+    };
+    let vaddr = guard_raw.virt_addr().bits() as u64 + offset;
+    //	log::info!("vaddr: 0x{:x}", vaddr);
+    //	log::info!("*vaddr: 0x{:x}", unsafe { *(vaddr as *mut u64) });
+    *guard = Some(guard_raw);
+    return vaddr;
+}
+
+use core::ffi::CStr;
+const BPF_PRINT: u32 = 13;
+fn bpf_print(value: u64, _: u64, _: u64, _: u64, _: u64) -> u64 {
+    log::info!("0x{:x}", value);
+    return value;
 }
 
 fn destroy_mapping() {
-	let mut shmem_guard = SHMEM_MAPPING_GUARD.lock_write();
-	let mut shmem_vaddr = SHMEM_VADDR.lock_write();
-	*shmem_guard = None;
-	*shmem_vaddr = None;
-}
-
-#[repr(C, packed)]
-#[derive(Copy, Clone)]
-struct P4SharedMemory {
-	flag_request: u32,
-	buf: [u8;128],
-}
-
-fn core_p4(_params : &mut RequestParams) -> Result<(), SvsmReqError> {
-	let shmem = unsafe {
-			let s = map_shmem() as *mut P4SharedMemory;
-			&mut *s
-		};
-	if shmem.flag_request != 1 {
-		log::info!("no request");
-		return Ok(());
-	}
-	
-	let mut len = 0;
-	while len < shmem.buf.len() && shmem.buf[len] != 0 {
-		len += 1;
-	}
-
-	let add_str = b" patched";
-	if len + add_str.len() < shmem.buf.len() {
-		shmem.buf[len..len+add_str.len()].copy_from_slice(add_str);
-	}
-
-	shmem.flag_request = 2;
-
-	unmap_shmem();
-	Ok(())
+    let mut shmem_guard = SHMEM_MAPPING_GUARD.lock_write();
+    let mut shmem_vaddr = SHMEM_VADDR.lock_write();
+    *shmem_guard = None;
+    *shmem_vaddr = None;
 }
 
 pub fn core_protocol_request(request: u32, params: &mut RequestParams) -> Result<(), SvsmReqError> {
@@ -832,12 +1007,11 @@ pub fn core_protocol_request(request: u32, params: &mut RequestParams) -> Result
         SVSM_REQ_CORE_WITHDRAW_MEM => core_withdraw_mem(params),
         SVSM_REQ_CORE_QUERY_PROTOCOL => core_query_protocol(params),
         SVSM_REQ_CORE_CONFIGURE_VTOM => core_configure_vtom(params),
-				SVSM_REQ_CORE_REGISTER_SHMEM => core_register_shmem(params),
-				SVSM_REQ_CORE_TEST => core_test(params),
-				SVSM_REQ_CORE_WRITE_SHMEM => core_write_shmem(params),
-				SVSM_REQ_CORE_NOTHING => core_nothing(params),
-				SVSM_REQ_CORE_RBPF => core_rbpf(), 
-				SVSM_REQ_CORE_P4 => core_p4(params),
+        SVSM_REQ_CORE_REGISTER_SHMEM => core_register_shmem(params),
+        SVSM_REQ_CORE_TEST => core_test(params),
+        SVSM_REQ_CORE_WRITE_SHMEM => core_write_shmem(params),
+        SVSM_REQ_CORE_NOTHING => core_nothing(params),
+        SVSM_REQ_CORE_RBPF => core_rbpf(),
         _ => Err(SvsmReqError::unsupported_call()),
     }
 }

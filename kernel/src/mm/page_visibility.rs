@@ -39,30 +39,30 @@ use zerocopy::{FromBytes, FromZeros};
 
 pub unsafe fn make_page_shared(vaddr: VirtAddr) -> Result<(), SvsmError> {
     // Revoke page validation before changing page state.
-		// let unchange = SvsmError::from(SevSnpError::FAIL_UNCHANGED(0x10));
-		/*
-    match SVSM_PLATFORM.validate_virtual_page_range(
+    // let unchange = SvsmError::from(SevSnpError::FAIL_UNCHANGED(0x10));
+    /*
+        match SVSM_PLATFORM.validate_virtual_page_range(
+            MemoryRegion::new(vaddr, PAGE_SIZE),
+            PageValidateOp::Invalidate,
+        ) {
+                Ok(()) => {},
+                Err(e) => {
+    //				if e != unchange {
+    //					return Err(e);
+    //				}
+                }
+            };
+            */
+    SVSM_PLATFORM.validate_virtual_page_range(
         MemoryRegion::new(vaddr, PAGE_SIZE),
         PageValidateOp::Invalidate,
-    ) {
-			Ok(()) => {},
-			Err(e) => {
-//				if e != unchange {
-//					return Err(e);
-//				}
-			}
-		};
-		*/
-		SVSM_PLATFORM.validate_virtual_page_range(
-			MemoryRegion::new(vaddr,PAGE_SIZE),
-			PageValidateOp::Invalidate,
-			)?;
+    )?;
     let paddr = virt_to_phys(vaddr);
     if valid_bitmap_valid_addr(paddr) {
         valid_bitmap_clear_valid_4k(paddr);
     }
 
-		log::info!("validate_virtual_page_range");
+    log::info!("validate_virtual_page_range");
 
     // Ask the hypervisor to make the page shared.
     SVSM_PLATFORM.page_state_change(

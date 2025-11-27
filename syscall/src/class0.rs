@@ -5,7 +5,7 @@
 // Author: Chuanxiao Dong <chuanxiao.dong@intel.com>
 
 use super::call::{syscall0, syscall1, syscall3, SysCallError};
-use super::{SYS_EXEC, SYS_EXIT, SYS_SCHEDULE, SYS_IDLE};
+use super::{SYS_EXEC, SYS_EXIT, SYS_IDLE, SYS_SCHEDULE};
 use core::ffi::CStr;
 
 pub fn exit(code: u32) -> ! {
@@ -39,13 +39,9 @@ pub fn exec(file: &CStr, root: &CStr, flags: u32) -> Result<Tid, SysCallError> {
 }
 
 pub fn sched() -> Result<u64, SysCallError> {
-	unsafe {
-		syscall0(SYS_SCHEDULE)
-	}
+    unsafe { syscall0(SYS_SCHEDULE) }
 }
 
 pub fn idle() -> Result<u64, SysCallError> {
-	unsafe {
-		syscall0(SYS_IDLE)
-	}
+    unsafe { syscall0(SYS_IDLE) }
 }

@@ -107,7 +107,7 @@ fn request_loop_once(
     protocol: u32,
     request: u32,
 ) -> Result<bool, SvsmReqError> {
-		//log::info!("request_loop_once() called.");
+    //log::info!("request_loop_once() called.");
     if !matches!(params.guest_exit_code, GuestVMExit::VMGEXIT) {
         return Ok(false);
     }
@@ -244,7 +244,7 @@ pub extern "C" fn request_processing_main() {
 
     loop {
         wait_for_requests();
-//				log::info!("request received!");
+        //				log::info!("request received!");
 
         // Obtain a reference to the VMSA just long enough to extract the
         // request parameters.

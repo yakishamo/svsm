@@ -109,9 +109,9 @@ impl PerCPUPageMappingGuard {
 
         Ok(Self { mapping })
     }
-		pub fn create_exec_4k(paddr: PhysAddr) -> Result<Self, SvsmError> {
-				Self::create_exec(paddr, paddr + PAGE_SIZE, 0)
-		}
+    pub fn create_exec_4k(paddr: PhysAddr) -> Result<Self, SvsmError> {
+        Self::create_exec(paddr, paddr + PAGE_SIZE, 0)
+    }
 
     /// Returns the virtual address associated with the guard.
     pub fn virt_addr(&self) -> VirtAddr {
@@ -290,7 +290,6 @@ impl<T: Copy> InsnMachineMem for MemMappingGuard<T> {
         unsafe { self.write(0, data).map_err(|_| InsnError::MemWrite) }
     }
 }
-
 
 /// Guard for a per-CPU page mapping to ensure adequate cleanup if drop.
 #[derive(Debug)]

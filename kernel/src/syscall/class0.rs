@@ -9,7 +9,7 @@ use crate::address::VirtAddr;
 use crate::cpu::percpu::current_task;
 use crate::fs::find_dir;
 use crate::mm::guestmem::UserPtr;
-use crate::task::{current_task_terminated, exec_user, schedule, go_idle};
+use crate::task::{current_task_terminated, exec_user, go_idle, schedule};
 use core::ffi::c_char;
 use syscall::SysCallError;
 
@@ -42,11 +42,11 @@ pub fn sys_close(obj_id: u32) -> Result<u64, SysCallError> {
 }
 
 pub fn sys_schedule() -> Result<u64, SysCallError> {
-	schedule();
-	Ok(0)
+    schedule();
+    Ok(0)
 }
 
 pub fn sys_idle() -> Result<u64, SysCallError> {
-	go_idle();
-	Ok(0)
+    go_idle();
+    Ok(0)
 }
